@@ -6,7 +6,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Compression {
+pub enum Compression {
     Uncompressed,
     Gzip,
     Snappy,
@@ -30,9 +30,10 @@ impl Compression {
     }
 }
 
-pub(crate) struct OutputConfig<'a> {
-    pub prefix: &'a str,
-    pub file_extension: Option<&'a str>,
+#[derive(Clone, Debug)]
+pub struct OutputConfig {
+    pub prefix: String,
+    pub file_extension: Option<String>,
     pub compression: Compression,
     /// The built-in `AppendDelimiterToRecord` processor: write `\n` after
     /// every record.
@@ -42,7 +43,8 @@ pub(crate) struct OutputConfig<'a> {
 /// Whether an S3 destination's `ProcessingConfiguration` enables the built-in
 /// `AppendDelimiterToRecord` processor. Only `Enabled: true` counts. AWS
 /// documents only a new line delimiter, so a `Delimiter` parameter is not
-/// interpreted. Other processor types are not run.
+/// interpreted. Delivery admission (`config::delivery_config`) rejects any
+/// other enabled processor as not implemented rather than skipping it.
 pub(crate) fn append_delimiter_enabled(processing_configuration: Option<&Value>) -> bool {
     processing_configuration.is_some_and(|processing| {
         processing["Enabled"].as_bool() == Some(true)
@@ -59,9 +61,9 @@ pub(crate) fn append_delimiter_enabled(processing_configuration: Option<&Value>)
 /// Firehose concatenates the raw record bytes, then compresses the whole
 /// payload as one stream. Producers supply any record delimiters unless
 /// `AppendDelimiterToRecord` adds `\n` after each record (before compression).
-pub(crate) fn encode_records(
-    records: &[Vec<u8>],
-    config: &OutputConfig<'_>,
+pub(crate) fn encode_records<T: AsRef<[u8]>>(
+    records: &[T],
+    config: &OutputConfig,
 ) -> std::io::Result<Bytes> {
     let delimiter: &[u8] = if config.append_delimiter { b"\n" } else { b"" };
     match config.compression {
@@ -69,11 +71,11 @@ pub(crate) fn encode_records(
             let mut payload = Vec::with_capacity(
                 records
                     .iter()
-                    .map(|record| record.len() + delimiter.len())
+                    .map(|record| record.as_ref().len() + delimiter.len())
                     .sum(),
             );
             for record in records {
-                payload.extend_from_slice(record);
+                payload.extend_from_slice(record.as_ref());
                 payload.extend_from_slice(delimiter);
             }
             Ok(Bytes::from(payload))
@@ -82,7 +84,7 @@ pub(crate) fn encode_records(
             let mut encoder =
                 flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             for record in records {
-                encoder.write_all(record)?;
+                encoder.write_all(record.as_ref())?;
                 encoder.write_all(delimiter)?;
             }
             Ok(Bytes::from(encoder.finish()?))
@@ -105,7 +107,7 @@ pub(crate) fn encode_records(
             // fixed-size block chunking rather than starting a new block.
             for part in records
                 .iter()
-                .flat_map(|record| [record.as_slice(), delimiter])
+                .flat_map(|record| [record.as_ref(), delimiter])
             {
                 let mut remaining = part;
                 while !remaining.is_empty() {
@@ -131,7 +133,7 @@ pub(crate) fn encode_records(
 pub(crate) fn object_key(
     stream: &str,
     version: &str,
-    config: &OutputConfig<'_>,
+    config: &OutputConfig,
     oldest_arrival: DateTime<Utc>,
     delivery_time: DateTime<Utc>,
     uuid: Uuid,
@@ -143,6 +145,7 @@ pub(crate) fn object_key(
         delivery_time.format("%Y-%m-%d-%H-%M-%S"),
         config
             .file_extension
+            .as_deref()
             .filter(|extension| !extension.is_empty())
             .unwrap_or_else(|| config.compression.extension()),
     )
@@ -159,6 +162,35 @@ mod tests {
         DateTime::parse_from_rfc3339(value)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn owned_bytes_records_encode_without_changing_payload() {
+        let records = [
+            Bytes::from_static(b"abc"),
+            Bytes::from_static(b"def\n\x00\xff"),
+        ];
+        for compression in [
+            Compression::Uncompressed,
+            Compression::Gzip,
+            Compression::Snappy,
+        ] {
+            for (append_delimiter, expected) in [
+                (false, &b"abcdef\n\x00\xff"[..]),
+                (true, &b"abc\ndef\n\x00\xff\n"[..]),
+            ] {
+                let encoded =
+                    encode_records(&records, &config(compression, append_delimiter)).unwrap();
+                let decoded = match compression {
+                    Compression::Uncompressed => encoded.to_vec(),
+                    Compression::Gzip => gunzip(&encoded),
+                    Compression::Snappy => crate::test_xerial_decoder::decode(&encoded)
+                        .unwrap()
+                        .concat(),
+                };
+                assert_eq!(decoded, expected);
+            }
+        }
     }
 
     #[test]
@@ -226,8 +258,8 @@ mod tests {
             (Some(".custom.log"), ".custom.log"),
         ] {
             let config = OutputConfig {
-                prefix: "",
-                file_extension: extension,
+                prefix: String::new(),
+                file_extension: extension.map(str::to_owned),
                 compression: Compression::Snappy,
                 append_delimiter: false,
             };
@@ -284,9 +316,9 @@ mod tests {
         }
     }
 
-    fn config(compression: Compression, append_delimiter: bool) -> OutputConfig<'static> {
+    fn config(compression: Compression, append_delimiter: bool) -> OutputConfig {
         OutputConfig {
-            prefix: "",
+            prefix: String::new(),
             file_extension: None,
             compression,
             append_delimiter,
@@ -327,8 +359,8 @@ mod tests {
             (Some(".custom.log"), ".custom.log"),
         ] {
             let config = OutputConfig {
-                prefix: "",
-                file_extension: extension,
+                prefix: String::new(),
+                file_extension: extension.map(str::to_owned),
                 compression: Compression::Gzip,
                 append_delimiter: false,
             };
@@ -362,7 +394,7 @@ mod tests {
         let plain = config(Compression::Uncompressed, true);
         assert_eq!(encode_records(&records, &plain).unwrap().as_ref(), expected);
         assert_eq!(encode_records(&[vec![]], &plain).unwrap().as_ref(), b"\n");
-        assert!(encode_records(&[], &plain).unwrap().is_empty());
+        assert!(encode_records::<Vec<u8>>(&[], &plain).unwrap().is_empty());
         // The delimiter is part of the payload that GZIP compresses.
         let gzip = config(Compression::Gzip, true);
         assert_eq!(gunzip(&encode_records(&records, &gzip).unwrap()), expected);
@@ -431,7 +463,7 @@ mod tests {
     #[test]
     fn static_prefix_and_suffix_use_distinct_utc_times() {
         let config = OutputConfig {
-            prefix: "events/",
+            prefix: "events/".to_owned(),
             file_extension: None,
             compression: Compression::Uncompressed,
             append_delimiter: false,
@@ -455,7 +487,7 @@ mod tests {
             ("events", Some(""), "events2026/10/12/09/events-1-2026-10-12-09-00-00-12345678-1234-4234-8234-123456789abc"),
             ("events/", Some(".custom.log"), "events/2026/10/12/09/events-1-2026-10-12-09-00-00-12345678-1234-4234-8234-123456789abc.custom.log"),
         ] {
-            let config = OutputConfig { prefix, file_extension: extension, compression: Compression::Uncompressed, append_delimiter: false };
+            let config = OutputConfig { prefix: prefix.to_owned(), file_extension: extension.map(str::to_owned), compression: Compression::Uncompressed, append_delimiter: false };
             let now = time("2026-10-12T09:00:00Z");
             assert_eq!(object_key("events", "1", &config, now, now,
                 Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap()), expected);

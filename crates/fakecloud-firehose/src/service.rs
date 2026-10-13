@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
+use bytes::Bytes;
 use chrono::Utc;
 use fakecloud_aws::arn::Arn;
 use http::StatusCode;
@@ -13,14 +14,10 @@ use uuid::Uuid;
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::{S3Store, SnapshotStore};
-use fakecloud_s3::delivery::{
-    put_object_via_store_with_options, DeliveryObjectOptions, DeliveryObjectRequest,
-};
 use fakecloud_s3::SharedS3State;
 
-use crate::output::{
-    append_delimiter_enabled, encode_records, object_key, Compression, OutputConfig,
-};
+use crate::config::{parse_buffering_hints, validate_file_extension};
+use crate::engine::FirehoseEngine;
 use crate::state::{
     DeliveryStream, EncryptionConfig, FirehoseAccounts, FirehoseSnapshot, S3Destination,
     SharedFirehoseState, FIREHOSE_SNAPSHOT_SCHEMA_VERSION,
@@ -56,14 +53,7 @@ const SUPPORTED_ACTIONS: &[&str] = &[
 
 pub struct FirehoseService {
     state: SharedFirehoseState,
-    s3: Option<SharedS3State>,
-    /// Durable S3 backing store. S3 durability is write-through to this store
-    /// (there is no `s3_state` snapshot; on boot S3 is rebuilt from the store),
-    /// so records delivered to an S3 destination must be routed through it or
-    /// they are lost on restart. Behind a lock so the CloudWatch-Logs delivery
-    /// hook (built before the S3 store exists) can be wired up after the fact
-    /// via `set_s3_store`.
-    s3_store: RwLock<Option<Arc<dyn S3Store>>>,
+    engine: Arc<FirehoseEngine>,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
 }
@@ -71,16 +61,27 @@ pub struct FirehoseService {
 impl FirehoseService {
     pub fn new(state: SharedFirehoseState) -> Self {
         Self {
+            engine: Arc::new(FirehoseEngine::new(state.clone())),
             state,
-            s3: None,
-            s3_store: RwLock::new(None),
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 
-    pub fn with_s3(mut self, s3: SharedS3State) -> Self {
-        self.s3 = Some(s3);
+    /// Adopt the engine's configuration state as well as its admission buffer,
+    /// so API mutations and snapshot hooks always describe the delivered stream.
+    pub fn with_engine(mut self, engine: Arc<FirehoseEngine>) -> Self {
+        self.state = engine.shared_state();
+        self.engine = engine;
+        self
+    }
+
+    pub fn delivery_engine(&self) -> Arc<FirehoseEngine> {
+        self.engine.clone()
+    }
+
+    pub fn with_s3(self, s3: SharedS3State) -> Self {
+        self.engine.set_s3(s3);
         self
     }
 
@@ -95,7 +96,7 @@ impl FirehoseService {
     /// `FirehoseDeliveryImpl`, whose delivery hook is built before the S3 store
     /// is available during server startup.
     pub fn set_s3_store(&self, store: Arc<dyn S3Store>) {
-        *self.s3_store.write() = Some(store);
+        self.engine.set_s3_store(store);
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -247,7 +248,7 @@ fn extract_extra_destinations(body: &Value, suffix: &str) -> BTreeMap<String, Va
     out
 }
 
-fn parse_s3_destination(val: &Value) -> Result<Option<S3Destination>, AwsServiceError> {
+pub(crate) fn parse_s3_destination(val: &Value) -> Result<Option<S3Destination>, AwsServiceError> {
     if !val.is_object() {
         return Ok(None);
     }
@@ -257,11 +258,10 @@ fn parse_s3_destination(val: &Value) -> Result<Option<S3Destination>, AwsService
     let Some(bucket_arn) = val["BucketARN"].as_str().map(|s| s.to_string()) else {
         return Ok(None);
     };
-    let buf = &val["BufferingHints"];
-    let buffering_size_mb = buf["SizeInMBs"].as_i64();
-    let buffering_interval_seconds = buf["IntervalInSeconds"].as_i64();
-    validate_buffering(buffering_size_mb, buffering_interval_seconds)?;
+    let (size, interval) = parse_buffering_hints(val)?;
     validate_file_extension(val)?;
+    let buffering_size_mb = Some(size.unwrap_or(5));
+    let buffering_interval_seconds = Some(interval.unwrap_or(300));
     Ok(Some(S3Destination {
         destination_id: format!("destinationId-{}", Uuid::new_v4()),
         role_arn,
@@ -301,38 +301,12 @@ fn invalid_argument(msg: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidArgumentException", msg)
 }
 
-pub(crate) fn validate_file_extension(value: &Value) -> Result<(), AwsServiceError> {
-    let Some(extension) = value.get("FileExtension") else {
-        return Ok(());
-    };
-    let extension = extension
-        .as_str()
-        .ok_or_else(|| invalid_argument("FileExtension must be a string"))?;
-    // Equivalent to ^(|\.[0-9a-z!\-_.*'()]+)$ without a regex dependency.
-    if extension.len() > 128
-        || (!extension.is_empty()
-            && (!extension.starts_with('.')
-                || extension.len() < 2
-                || !extension[1..].bytes().all(|c| {
-                    c.is_ascii_digit()
-                        || c.is_ascii_lowercase()
-                        || matches!(c, b'!' | b'-' | b'_' | b'.' | b'*' | b'\'' | b'(' | b')')
-                })))
-    {
-        return Err(invalid_argument("FileExtension must be empty or a dot followed by lowercase letters, digits, or !-_.*'(), with at most 128 characters"));
-    }
-    Ok(())
-}
-
 /// Apply a partial `*S3DestinationUpdate` block onto an existing destination.
 /// Every field in the `*Update` shape is optional, so only the members the
 /// caller supplied are changed; the destination's stable `DestinationId` is
 /// preserved. Buffering values are validated when present.
 fn apply_s3_update(dest: &mut S3Destination, val: &Value) -> Result<(), AwsServiceError> {
-    let buf = &val["BufferingHints"];
-    let size = buf["SizeInMBs"].as_i64();
-    let interval = buf["IntervalInSeconds"].as_i64();
-    validate_buffering(size, interval)?;
+    let (size, interval) = parse_buffering_hints(val)?;
     validate_file_extension(val)?;
 
     if let Some(v) = val["RoleARN"].as_str() {
@@ -446,37 +420,11 @@ const DELIVERY_STREAM_TYPES: &[&str] = &[
     "DatabaseAsSource",
 ];
 
-/// AWS limits per Firehose docs: SizeInMBs in [1,128], IntervalInSeconds
-/// either 0 (immediate) or in [60,900].
-fn validate_buffering(
-    size_mb: Option<i64>,
-    interval_s: Option<i64>,
-) -> Result<(), AwsServiceError> {
-    if let Some(s) = size_mb {
-        if !(1..=128).contains(&s) {
-            return Err(invalid_argument(format!(
-                "BufferingHints.SizeInMBs must be between 1 and 128, got {s}"
-            )));
-        }
-    }
-    if let Some(i) = interval_s {
-        if i != 0 && !(60..=900).contains(&i) {
-            return Err(invalid_argument(format!(
-                "BufferingHints.IntervalInSeconds must be 0 or between 60 and 900, got {i}"
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn s3_destination_json(dest: &S3Destination) -> Value {
-    let mut buf = json!({});
-    if let Some(s) = dest.buffering_size_mb {
-        buf["SizeInMBs"] = json!(s);
-    }
-    if let Some(i) = dest.buffering_interval_seconds {
-        buf["IntervalInSeconds"] = json!(i);
-    }
+    let buf = json!({
+        "SizeInMBs": dest.buffering_size_mb.unwrap_or(5),
+        "IntervalInSeconds": dest.buffering_interval_seconds.unwrap_or(300),
+    });
     let mut s3 = json!({
         "RoleARN": dest.role_arn,
         "BucketARN": dest.bucket_arn,
@@ -579,10 +527,6 @@ fn arn_for(region: &str, account: &str, name: &str) -> String {
     .to_string()
 }
 
-fn bucket_name_from_arn(arn: &str) -> Option<&str> {
-    fakecloud_aws::arn::arn_resource(arn, "s3")?.strip_prefix("::")
-}
-
 impl FirehoseService {
     fn create_delivery_stream(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
@@ -638,6 +582,7 @@ impl FirehoseService {
         }
         let arn = arn_for(&req.region, &req.account_id, &name);
         let stream = DeliveryStream {
+            instance_id: Uuid::new_v4(),
             name: name.clone(),
             arn: arn.clone(),
             status: "ACTIVE".to_string(),
@@ -797,6 +742,11 @@ impl FirehoseService {
                     "Record.Data must be valid base64",
                 )
             })?;
+        if data.len() > 1_024_000 {
+            return Err(invalid_argument(
+                "Record.Data exceeds 1,024,000 decoded bytes",
+            ));
+        }
         let record_id = format!("{}", Uuid::new_v4());
         self.deliver_records(&req.account_id, &req.region, &name, vec![data])?;
         Ok(AwsResponse::ok_json(json!({
@@ -814,13 +764,28 @@ impl FirehoseService {
         let records = body["Records"]
             .as_array()
             .ok_or_else(|| missing("Records"))?;
+        if !(1..=500).contains(&records.len()) {
+            return Err(invalid_argument(
+                "Records must contain between 1 and 500 entries",
+            ));
+        }
         let mut datas = Vec::with_capacity(records.len());
         let mut response_records = Vec::with_capacity(records.len());
         let mut failed = 0;
+        let mut decoded_bytes = 0;
         for r in records {
             let b64 = r["Data"].as_str();
             match b64.map(|s| base64::engine::general_purpose::STANDARD.decode(s)) {
-                Some(Ok(data)) if !data.is_empty() => {
+                Some(Ok(data)) => {
+                    if data.len() > 1_024_000 {
+                        return Err(invalid_argument(
+                            "Record.Data exceeds 1,024,000 decoded bytes",
+                        ));
+                    }
+                    decoded_bytes += data.len();
+                    if decoded_bytes > 4_194_304 {
+                        return Err(invalid_argument("Records exceed 4,194,304 decoded bytes"));
+                    }
                     datas.push(data);
                     response_records.push(json!({
                         "RecordId": Uuid::new_v4().to_string(),
@@ -835,20 +800,9 @@ impl FirehoseService {
                 }
             }
         }
-        if !datas.is_empty() {
-            self.deliver_records(&req.account_id, &req.region, &name, datas)?;
-        } else if failed == records.len() && !records.is_empty() {
-            // Validate stream exists even when nothing delivers, so callers
-            // get a clear ResourceNotFoundException for typos.
-            let accounts = self.state.read();
-            let state = accounts
-                .get(&req.account_id)
-                .ok_or_else(|| not_found(&name))?;
-            state
-                .streams(&req.region)
-                .and_then(|s| s.get(&name))
-                .ok_or_else(|| not_found(&name))?;
-        }
+        // One handoff after all decoding/limits: request-wide rejection cannot
+        // partially admit data. Empty/all-invalid requests still run preflight.
+        self.deliver_records(&req.account_id, &req.region, &name, datas)?;
         Ok(AwsResponse::ok_json(json!({
             "FailedPutCount": failed,
             "Encrypted": false,
@@ -1093,112 +1047,12 @@ impl FirehoseService {
         stream_name: &str,
         datas: Vec<Vec<u8>>,
     ) -> Result<(), AwsServiceError> {
-        let (dest, version_id) = {
-            let accounts = self.state.read();
-            let state = accounts
-                .get(account_id)
-                .ok_or_else(|| not_found(stream_name))?;
-            let stream = state
-                .streams(region)
-                .and_then(|s| s.get(stream_name))
-                .ok_or_else(|| not_found(stream_name))?;
-            (stream.destination.clone(), stream.version_id.clone())
-        };
-        let Some(dest) = dest else {
-            return Ok(());
-        };
-        let Some(s3) = &self.s3 else {
-            return Ok(());
-        };
-        let Some(bucket_name) = bucket_name_from_arn(&dest.bucket_arn) else {
-            // AWS accepts PutRecord/PutRecordBatch into the delivery buffer and
-            // reports delivery failures asynchronously (CloudWatch metrics /
-            // S3 error-output), never as an API error, so the caller still gets
-            // a 200 + RecordId. We can't deliver a malformed destination ARN, so
-            // warn for observability instead of dropping it silently.
-            tracing::warn!(
-                stream = %stream_name,
-                bucket_arn = %dest.bucket_arn,
-                "firehose S3 destination has a malformed bucket ARN; records not delivered",
-            );
-            return Ok(());
-        };
-        let output = OutputConfig {
-            prefix: dest.prefix.as_deref().unwrap_or_default(),
-            file_extension: dest.file_extension.as_deref(),
-            compression: match dest.compression_format.as_deref() {
-                Some("GZIP") => Compression::Gzip,
-                Some("Snappy") => Compression::Snappy,
-                _ => Compression::Uncompressed,
-            },
-            append_delimiter: append_delimiter_enabled(dest.processing_configuration.as_ref()),
-        };
-        // Judge emptiness by the uncompressed payload: GZIP encodes even an
-        // empty payload into nonempty bytes, while an appended delimiter makes
-        // any record nonempty.
-        let delimited = output.append_delimiter && !datas.is_empty();
-        if !delimited && datas.iter().all(Vec::is_empty) {
-            return Ok(());
-        }
-        let bytes = match encode_records(&datas, &output) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                tracing::error!(stream = %stream_name, %err, "failed to encode firehose S3 delivery; records not delivered");
-                return Ok(());
-            }
-        };
-        let now = Utc::now();
-        let key = object_key(stream_name, &version_id, &output, now, now, Uuid::new_v4());
-        // Snapshot the durable store handle before taking the S3 state lock so we
-        // never hold two locks at once.
-        let store = self.s3_store.read().clone();
-        let bucket_exists = s3
-            .read()
-            .get(account_id)
-            .is_some_and(|state| state.buckets.contains_key(bucket_name));
-        if !bucket_exists {
-            // As above: AWS acknowledges the records (async delivery) even when
-            // the destination bucket is absent. Warn for observability rather
-            // than dropping silently, but don't fail the API call.
-            tracing::warn!(
-                stream = %stream_name,
-                bucket = %bucket_name,
-                "firehose S3 destination bucket does not exist; records not delivered",
-            );
-            return Ok(());
-        }
-        let write = |store: Option<&dyn S3Store>| {
-            put_object_via_store_with_options(
-                s3,
-                store,
-                DeliveryObjectRequest {
-                    account: account_id,
-                    bucket: bucket_name,
-                    key: &key,
-                    body: bytes.clone(),
-                    options: DeliveryObjectOptions {
-                        content_type: None,
-                        content_encoding: output.compression.content_encoding().map(str::to_owned),
-                    },
-                },
-            )
-        };
-        if let Err(err) = write(store.as_deref()) {
-            if store.is_some() {
-                // Preserve immediate delivery's session-only fallback until the
-                // buffered engine can retain and retry failed batches.
-                tracing::error!(stream = %stream_name, bucket = %bucket_name, %err,
-                    "failed to persist firehose delivery to S3 store; attempting memory-only delivery");
-                if let Err(err) = write(None) {
-                    tracing::warn!(stream = %stream_name, bucket = %bucket_name, %err,
-                        "firehose S3 fallback failed; records not delivered");
-                }
-            } else {
-                tracing::warn!(stream = %stream_name, bucket = %bucket_name, %err,
-                    "firehose S3 delivery failed; records not delivered");
-            }
-        }
-        Ok(())
+        self.engine.enqueue(
+            account_id,
+            region,
+            stream_name,
+            datas.into_iter().map(Bytes::from).collect(),
+        )
     }
 }
 
@@ -1213,6 +1067,7 @@ fn not_found(name: &str) -> AwsServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::buffering_policy;
     use bytes::Bytes;
     use http::{HeaderMap, Method};
 
@@ -1239,6 +1094,139 @@ mod tests {
 
     fn service() -> FirehoseService {
         FirehoseService::default()
+    }
+
+    #[test]
+    fn failed_s3_update_does_not_mutate_configuration_or_version() {
+        let svc = service();
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "atomic",
+                "ExtendedS3DestinationConfiguration": {
+                    "RoleARN": "role", "BucketARN": "arn:aws:s3:::bucket", "Prefix": "before/"
+                }
+            }),
+        ))
+        .unwrap();
+        let before = describe(&svc, "atomic");
+        for update in [
+            json!({"Prefix": "changed/", "FileExtension": "bad"}),
+            json!({"Prefix": "changed/", "BufferingHints": {"SizeInMBs": 1}}),
+            json!({"Prefix": "changed/", "BufferingHints": {"SizeInMBs": "1", "IntervalInSeconds": 300}}),
+            json!({"Prefix": "changed/", "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 901}}),
+        ] {
+            let error = svc
+                .update_destination(&request(
+                    "UpdateDestination",
+                    json!({
+                        "DeliveryStreamName": "atomic",
+                        "CurrentDeliveryStreamVersionId": "1",
+                        "DestinationId": before["Destinations"][0]["DestinationId"],
+                        "ExtendedS3DestinationUpdate": update
+                    }),
+                ))
+                .err()
+                .expect("invalid update must fail");
+            assert_eq!(error.code(), "InvalidArgumentException");
+            assert_eq!(describe(&svc, "atomic"), before);
+        }
+        assert_eq!(
+            before["Destinations"][0]["ExtendedS3DestinationDescription"]["BufferingHints"],
+            json!({"SizeInMBs": 5, "IntervalInSeconds": 300})
+        );
+    }
+
+    #[test]
+    fn unsupported_delivery_configuration_still_round_trips() {
+        let svc = service();
+        let config = json!({
+            "RoleARN": "role", "BucketARN": "arn:aws:s3:::bucket",
+            "CompressionFormat": "ZIP", "Prefix": "!{timestamp:yyyy}/",
+            "CustomTimeZone": "America/New_York",
+            "ProcessingConfiguration": {"Enabled": true},
+            "DataFormatConversionConfiguration": {},
+            "DynamicPartitioningConfiguration": {"Enabled": true}
+        });
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            json!({"DeliveryStreamName": "accepted", "ExtendedS3DestinationConfiguration": config}),
+        ))
+        .unwrap();
+        let before = describe(&svc, "accepted");
+        let ext = &before["Destinations"][0]["ExtendedS3DestinationDescription"];
+        for (field, value) in config.as_object().unwrap() {
+            assert_eq!(&ext[field], value);
+        }
+        svc.update_destination(&request(
+            "UpdateDestination",
+            json!({
+                "DeliveryStreamName": "accepted",
+                "CurrentDeliveryStreamVersionId": "1",
+                "DestinationId": before["Destinations"][0]["DestinationId"],
+                "ExtendedS3DestinationUpdate": {"CompressionFormat": "HADOOP_SNAPPY"}
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            describe(&svc, "accepted")["Destinations"][0]["ExtendedS3DestinationDescription"]
+                ["CompressionFormat"],
+            "HADOOP_SNAPPY"
+        );
+    }
+
+    #[test]
+    fn stream_creations_have_distinct_instance_identity_and_update_preserves_it() {
+        let svc = service();
+        for name in ["first", "second"] {
+            svc.create_delivery_stream(&request(
+                "CreateDeliveryStream",
+                json!({
+                    "DeliveryStreamName": name,
+                    "S3DestinationConfiguration": {"RoleARN": "role", "BucketARN": "arn:aws:s3:::bucket"}
+                }),
+            ))
+            .unwrap();
+        }
+        let first = svc
+            .state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .streams("us-east-1")
+            .unwrap()["first"]
+            .instance_id;
+        let second = svc
+            .state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .streams("us-east-1")
+            .unwrap()["second"]
+            .instance_id;
+        assert_ne!(first, second);
+        let before = describe(&svc, "first");
+        svc.update_destination(&request(
+            "UpdateDestination",
+            json!({
+                "DeliveryStreamName": "first",
+                "CurrentDeliveryStreamVersionId": "1",
+                "DestinationId": before["Destinations"][0]["DestinationId"],
+                "S3DestinationUpdate": {"BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 30}}
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            svc.state
+                .read()
+                .get("123456789012")
+                .unwrap()
+                .streams("us-east-1")
+                .unwrap()["first"]
+                .instance_id,
+            first
+        );
+        assert_eq!(describe(&svc, "first")["VersionId"], "2");
     }
 
     fn create(svc: &FirehoseService, name: &str) {
@@ -1426,32 +1414,32 @@ mod tests {
 
     #[test]
     fn buffering_size_within_range_ok() {
-        assert!(validate_buffering(Some(64), Some(300)).is_ok());
+        assert!(buffering_policy(Some(64), Some(300)).is_ok());
     }
 
     #[test]
     fn buffering_size_too_small_rejected() {
-        assert!(validate_buffering(Some(0), None).is_err());
+        assert!(buffering_policy(Some(0), Some(300)).is_err());
     }
 
     #[test]
     fn buffering_size_too_large_rejected() {
-        assert!(validate_buffering(Some(200), None).is_err());
+        assert!(buffering_policy(Some(200), Some(300)).is_err());
     }
 
     #[test]
     fn buffering_interval_zero_ok() {
-        assert!(validate_buffering(None, Some(0)).is_ok());
+        assert!(buffering_policy(Some(5), Some(0)).is_ok());
     }
 
     #[test]
-    fn buffering_interval_below_60_rejected() {
-        assert!(validate_buffering(None, Some(30)).is_err());
+    fn buffering_interval_below_60_accepted() {
+        assert!(buffering_policy(Some(5), Some(30)).is_ok());
     }
 
     #[test]
     fn buffering_interval_above_900_rejected() {
-        assert!(validate_buffering(None, Some(1200)).is_err());
+        assert!(buffering_policy(Some(5), Some(1200)).is_err());
     }
 
     #[test]
@@ -1806,6 +1794,468 @@ mod tests {
 
     const S3_ACCOUNT: &str = "123456789012";
 
+    fn memory_fixture() -> (FirehoseService, SharedS3State) {
+        let s3: SharedS3State = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new(
+                S3_ACCOUNT,
+                "us-east-1",
+                "http://localhost",
+            ),
+        ));
+        s3.write().get_or_create(S3_ACCOUNT).buckets.insert(
+            "buffered".into(),
+            fakecloud_s3::S3Bucket::new("buffered", "us-east-1", "owner"),
+        );
+        let svc = service().with_s3(s3.clone());
+        create_s3_stream(&svc, "buffered", "buffered");
+        (svc, s3)
+    }
+
+    fn put(svc: &FirehoseService, data: &[u8]) -> Result<AwsResponse, AwsServiceError> {
+        svc.put_record(&request(
+            "PutRecord",
+            json!({
+                "DeliveryStreamName": "buffered",
+                "Record": {"Data": base64::engine::general_purpose::STANDARD.encode(data)}
+            }),
+        ))
+    }
+
+    fn batch(svc: &FirehoseService, records: Vec<Value>) -> Result<AwsResponse, AwsServiceError> {
+        svc.put_record_batch(&request(
+            "PutRecordBatch",
+            json!({
+                "DeliveryStreamName": "buffered", "Records": records
+            }),
+        ))
+    }
+
+    fn record(data: &[u8]) -> Value {
+        json!({"Data": base64::engine::general_purpose::STANDARD.encode(data)})
+    }
+
+    #[test]
+    fn task5_public_ack_precedes_delivery() {
+        let (svc, s3) = memory_fixture();
+        let response = put(&svc, b"accepted").unwrap();
+        let response: Value = serde_json::from_slice(response.body.expect_bytes()).unwrap();
+        assert!(response["RecordId"].as_str().is_some());
+        assert!(s3.read().get(S3_ACCOUNT).unwrap().buckets["buffered"]
+            .objects
+            .is_empty());
+    }
+
+    #[test]
+    fn task5_record_and_batch_input_limits() {
+        let (svc, _) = memory_fixture();
+        put(&svc, &vec![1; 1_024_000]).unwrap();
+        for result in [
+            put(&svc, &vec![2; 1_024_001]),
+            batch(&svc, vec![]),
+            batch(&svc, vec![record(b"x"); 501]),
+            batch(&svc, vec![record(b"before"), record(&vec![2; 1_024_001])]),
+            batch(&svc, vec![record(&vec![3; 1_000_000]); 5]),
+        ] {
+            let error = result
+                .err()
+                .expect("over-limit request must fail before admission");
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(error.code(), "InvalidArgumentException");
+        }
+        batch(&svc, vec![record(b"x"); 500]).unwrap();
+    }
+
+    #[test]
+    fn task5_empty_and_malformed_batch_entry_order() {
+        let (svc, _) = memory_fixture();
+        let response = batch(
+            &svc,
+            vec![
+                json!({"Data": "%%%"}),
+                record(b""),
+                record(b"valid"),
+                json!({}),
+            ],
+        )
+        .unwrap();
+        let response: Value = serde_json::from_slice(response.body.expect_bytes()).unwrap();
+        assert_eq!(response["FailedPutCount"], 2);
+        let entries = response["RequestResponses"].as_array().unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0]["ErrorCode"], "InvalidArgumentException");
+        assert!(entries[1]["RecordId"].as_str().is_some());
+        assert!(entries[2]["RecordId"].as_str().is_some());
+        assert_eq!(entries[3]["ErrorCode"], "InvalidArgumentException");
+        let error = svc
+            .put_record_batch(&request(
+                "PutRecordBatch",
+                json!({
+                    "DeliveryStreamName": "absent", "Records": [{"Data": "%%%"}]
+                }),
+            ))
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), "ResourceNotFoundException");
+    }
+
+    #[tokio::test]
+    async fn task5_unsupported_delivery_rejects_before_ack() {
+        for setting in [
+            json!({"CompressionFormat": "ZIP"}),
+            json!({"CompressionFormat": "HADOOP_SNAPPY"}),
+            json!({"Prefix": "!{timestamp:yyyy}/"}),
+            json!({"CustomTimeZone": "America/New_York"}),
+            json!({"ProcessingConfiguration": {"Enabled": true}}),
+            json!({"ProcessingConfiguration": {"Enabled": true, "Processors": [{"Type": "Lambda"}, {"Type": "AppendDelimiterToRecord"}]}}),
+            json!({"DataFormatConversionConfiguration": {}}),
+            json!({"DataFormatConversionConfiguration": {"Enabled": true}}),
+            json!({"DynamicPartitioningConfiguration": {"Enabled": true}}),
+        ] {
+            let svc = service();
+            let mut config = json!({"RoleARN": "role", "BucketARN": "arn:aws:s3:::bucket"});
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(setting.as_object().unwrap().clone());
+            svc.create_delivery_stream(&request(
+                "CreateDeliveryStream",
+                json!({
+                    "DeliveryStreamName": "buffered", "ExtendedS3DestinationConfiguration": config
+                }),
+            ))
+            .unwrap();
+            let description = describe(&svc, "buffered");
+            for (field, value) in setting.as_object().unwrap() {
+                assert_eq!(
+                    &description["Destinations"][0]["ExtendedS3DestinationDescription"][field],
+                    value
+                );
+            }
+            for result in [put(&svc, b"x"), batch(&svc, vec![record(b"x")])] {
+                let error = result.err().expect("unsupported delivery must not ACK");
+                assert_eq!(error.status(), StatusCode::NOT_IMPLEMENTED);
+                assert_eq!(error.code(), "NotImplemented");
+            }
+            assert_eq!(
+                svc.delivery_engine().shutdown().await,
+                crate::DrainReport::default()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_delete_recreate_cannot_deliver_old_buffer() {
+        let (svc, s3) = memory_fixture();
+        put(&svc, b"old").unwrap();
+        svc.delete_delivery_stream(&request(
+            "DeleteDeliveryStream",
+            json!({
+                "DeliveryStreamName": "buffered"
+            }),
+        ))
+        .unwrap();
+        create_s3_stream(&svc, "buffered", "buffered");
+        put(&svc, b"new").unwrap();
+        assert_eq!(
+            svc.delivery_engine().shutdown().await,
+            crate::DrainReport {
+                delivered_batches: 1,
+                undelivered_records: 0,
+                undelivered_bytes: 0,
+            }
+        );
+        let s3 = s3.read();
+        let objects = &s3.get(S3_ACCOUNT).unwrap().buckets["buffered"].objects;
+        assert_eq!(objects.len(), 1);
+        let fakecloud_persistence::BodyRef::Memory(body) = &objects.values().next().unwrap().body
+        else {
+            panic!("memory fixture")
+        };
+        assert_eq!(body.as_ref(), b"new");
+    }
+
+    #[tokio::test]
+    async fn public_buffered_update_uses_new_destination_at_detachment() {
+        use std::io::Read;
+        let (svc, s3) = memory_fixture();
+        put(&svc, b"before-update").unwrap();
+        s3.write().get_or_create(S3_ACCOUNT).buckets.insert(
+            "updated".into(),
+            fakecloud_s3::S3Bucket::new("updated", "us-east-1", "owner"),
+        );
+        let before = describe(&svc, "buffered");
+        svc.update_destination(&request(
+            "UpdateDestination",
+            json!({
+                "DeliveryStreamName": "buffered", "CurrentDeliveryStreamVersionId": "1",
+                "DestinationId": before["Destinations"][0]["DestinationId"],
+                "ExtendedS3DestinationUpdate": {
+                    "BucketARN": "arn:aws:s3:::updated", "CompressionFormat": "GZIP",
+                    "Prefix": "new/", "FileExtension": ".updated"
+                }
+            }),
+        ))
+        .unwrap();
+        assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
+        let s3 = s3.read();
+        assert!(s3.get(S3_ACCOUNT).unwrap().buckets["buffered"]
+            .objects
+            .is_empty());
+        let objects = &s3.get(S3_ACCOUNT).unwrap().buckets["updated"].objects;
+        assert_eq!(objects.len(), 1);
+        let object = objects.values().next().unwrap();
+        assert!(object.key.starts_with("new/"));
+        assert!(object.key.contains("/buffered-2-"));
+        assert!(object.key.ends_with(".updated"));
+        assert_eq!(object.content_encoding.as_deref(), Some("gzip"));
+        let fakecloud_persistence::BodyRef::Memory(body) = &object.body else {
+            panic!("memory fixture")
+        };
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(body.as_ref())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, b"before-update");
+    }
+
+    async fn wait_for_object(s3: &SharedS3State) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !s3.read().get(S3_ACCOUNT).unwrap().buckets["buffered"]
+                    .objects
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary worker must publish the threshold batch");
+    }
+
+    #[tokio::test]
+    async fn api_and_internal_hook_share_buffer() {
+        use fakecloud_core::delivery::FirehoseDelivery;
+        let (svc, s3) = memory_fixture();
+        let before = describe(&svc, "buffered");
+        svc.update_destination(&request("UpdateDestination", json!({
+            "DeliveryStreamName": "buffered", "CurrentDeliveryStreamVersionId": "1",
+            "DestinationId": before["Destinations"][0]["DestinationId"],
+            "ExtendedS3DestinationUpdate": {"BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 900}}
+        }))).unwrap();
+        let engine = svc.delivery_engine();
+        let hook = crate::FirehoseDeliveryImpl::with_engine(engine.clone());
+        // Construction and admission are inert until explicitly started.
+        let response = put(&svc, &vec![b'a'; 524_288]).unwrap();
+        assert!(
+            serde_json::from_slice::<Value>(response.body.expect_bytes()).unwrap()["RecordId"]
+                .is_string()
+        );
+        assert!(s3.read().get(S3_ACCOUNT).unwrap().buckets["buffered"]
+            .objects
+            .is_empty());
+        hook.put_record(
+            "arn:aws:firehose:us-east-1:123456789012:deliverystream/buffered",
+            &vec![b'b'; 524_288],
+        );
+        assert!(s3.read().get(S3_ACCOUNT).unwrap().buckets["buffered"]
+            .objects
+            .is_empty());
+        engine.start().unwrap();
+        wait_for_object(&s3).await;
+        let report = engine.shutdown().await;
+        assert_eq!(report.undelivered_records, 0);
+        {
+            let s3 = s3.read();
+            let objects = &s3.get(S3_ACCOUNT).unwrap().buckets["buffered"].objects;
+            assert_eq!(
+                objects.len(),
+                1,
+                "API and internal sources must aggregate, not use separate engines"
+            );
+            let object = objects.values().next().unwrap();
+            assert_eq!(object.size, 1_048_576);
+            let fakecloud_persistence::BodyRef::Memory(body) = &object.body else {
+                panic!("memory fixture")
+            };
+            assert_eq!(&body[..524_288], vec![b'a'; 524_288]);
+            assert_eq!(&body[524_288..], vec![b'b'; 524_288]);
+        }
+        hook.put_record(
+            "arn:aws:firehose:us-east-1:123456789012:deliverystream/buffered",
+            b"late",
+        );
+        assert_eq!(
+            put(&svc, b"late").err().unwrap().code(),
+            "ServiceUnavailableException"
+        );
+        assert_eq!(engine.shutdown().await, report);
+    }
+
+    #[tokio::test]
+    async fn decoded_batch_maximum_and_atomic_rejection() {
+        let exact = vec![record(&vec![1; 1_024_000]); 4];
+        for records in [
+            {
+                let mut r = exact.clone();
+                r.push(record(&vec![2; 98_305]));
+                r
+            },
+            vec![record(b"first"), record(&vec![3; 1_024_001])],
+            vec![record(b"first"); 501],
+            vec![],
+        ] {
+            let (svc, s3) = memory_fixture();
+            // Previously accepted data is the only data allowed to drain after
+            // the rejected call, even if earlier entries were individually valid.
+            put(&svc, b"existing").unwrap();
+            let error = batch(&svc, records)
+                .err()
+                .expect("whole request must be rejected");
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(error.code(), "InvalidArgumentException");
+            let report = svc.delivery_engine().shutdown().await;
+            assert_eq!(report.delivered_batches, 1);
+            assert_eq!(report.undelivered_records, 0);
+            let s3 = s3.read();
+            let objects = &s3.get(S3_ACCOUNT).unwrap().buckets["buffered"].objects;
+            assert_eq!(objects.len(), 1);
+            let fakecloud_persistence::BodyRef::Memory(body) =
+                &objects.values().next().unwrap().body
+            else {
+                panic!("memory fixture")
+            };
+            assert_eq!(
+                body.as_ref(),
+                b"existing",
+                "no partial admission from rejected request"
+            );
+        }
+        let (svc, s3) = memory_fixture();
+        let mut exact = exact;
+        exact.push(record(&vec![2; 98_304]));
+        // Malformed entries are not included in the decoded-byte sum.
+        exact.insert(0, json!({"Data": "%%%"}));
+        let response = batch(&svc, exact).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(response.body.expect_bytes()).unwrap()
+                ["FailedPutCount"],
+            1
+        );
+        assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
+        let s3 = s3.read();
+        let objects = &s3.get(S3_ACCOUNT).unwrap().buckets["buffered"].objects;
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects.values().next().unwrap().size, 4_194_304);
+    }
+
+    #[tokio::test]
+    async fn malformed_batch_admits_only_valid_bytes_and_empty_blobs_create_no_objects() {
+        let (svc, s3) = memory_fixture();
+        batch(
+            &svc,
+            vec![
+                json!({"Data": "%%%"}),
+                record(b""),
+                record(b"a"),
+                json!({}),
+                record(b"b"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
+        let objects = s3.read().get(S3_ACCOUNT).unwrap().buckets["buffered"]
+            .objects
+            .clone();
+        assert_eq!(objects.len(), 1);
+        let fakecloud_persistence::BodyRef::Memory(body) = &objects.values().next().unwrap().body
+        else {
+            panic!("memory fixture")
+        };
+        assert_eq!(body.as_ref(), b"ab");
+        let (svc, s3) = memory_fixture();
+        put(&svc, b"").unwrap();
+        let response = batch(&svc, vec![record(b""); 500]).unwrap();
+        let response: Value = serde_json::from_slice(response.body.expect_bytes()).unwrap();
+        assert_eq!(response["FailedPutCount"], 0);
+        assert_eq!(response["RequestResponses"].as_array().unwrap().len(), 500);
+        assert_eq!(
+            svc.delivery_engine().shutdown().await,
+            crate::DrainReport::default()
+        );
+        assert!(s3.read().get(S3_ACCOUNT).unwrap().buckets["buffered"]
+            .objects
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_s3_destination_ack_obeys_shutdown_cutoff() {
+        let svc = service();
+        create(&svc, "buffered");
+        put(&svc, b"configuration-only").unwrap();
+        batch(&svc, vec![record(b"configuration-only")]).unwrap();
+        assert_eq!(
+            svc.delivery_engine().shutdown().await,
+            crate::DrainReport::default()
+        );
+        for result in [
+            put(&svc, b"late"),
+            batch(&svc, vec![record(b"late")]),
+            batch(&svc, vec![json!({"Data": "%%%"})]),
+        ] {
+            let error = result.err().unwrap();
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error.code(), "ServiceUnavailableException");
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_engine_state_is_used_by_api_and_snapshot_hooks() {
+        let (existing, s3) = memory_fixture();
+        let engine = existing.delivery_engine();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(fakecloud_persistence::DiskSnapshotStore::new(
+            tmp.path().join("firehose.json"),
+        ));
+        let svc = service()
+            .with_snapshot_store(store.clone())
+            .with_engine(engine.clone());
+        assert!(Arc::ptr_eq(&svc.shared_state(), &existing.shared_state()));
+        assert!(Arc::ptr_eq(&svc.delivery_engine(), &engine));
+        assert_eq!(describe(&svc, "buffered")["DeliveryStreamName"], "buffered");
+        put(&svc, b"pending-data-not-in-snapshot").unwrap();
+        svc.handle(request(
+            "TagDeliveryStream",
+            json!({
+                "DeliveryStreamName": "buffered", "Tags": [{"Key": "shared", "Value": "yes"}]
+            }),
+        ))
+        .await
+        .unwrap();
+        svc.snapshot_hook().unwrap()().await;
+        let bytes = store.load().unwrap().unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("pending-data-not-in-snapshot"));
+        let snapshot: FirehoseSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let accounts = snapshot.accounts.unwrap();
+        assert_eq!(
+            accounts
+                .get(S3_ACCOUNT)
+                .unwrap()
+                .streams("us-east-1")
+                .unwrap()["buffered"]
+                .tags["shared"],
+            "yes"
+        );
+        assert_eq!(engine.shutdown().await.delivered_batches, 1);
+        assert_eq!(
+            s3.read().get(S3_ACCOUNT).unwrap().buckets["buffered"]
+                .objects
+                .len(),
+            1
+        );
+    }
+
     /// Build an S3 state seeded with `bucket`, plus a matching on-disk
     /// [`DiskS3Store`] (with the bucket's meta so `load()` surfaces it), and a
     /// FirehoseService wired to both.
@@ -1813,6 +2263,7 @@ mod tests {
         bucket: &str,
     ) -> (
         FirehoseService,
+        SharedS3State,
         std::sync::Arc<fakecloud_persistence::s3::DiskS3Store>,
         tempfile::TempDir,
     ) {
@@ -1842,9 +2293,9 @@ mod tests {
         let s3_state = std::sync::Arc::new(RwLock::new(mas));
 
         let svc = FirehoseService::new(Arc::new(RwLock::new(FirehoseAccounts::new())))
-            .with_s3(s3_state)
+            .with_s3(s3_state.clone())
             .with_s3_store(disk.clone() as std::sync::Arc<dyn S3Store>);
-        (svc, disk, tmp)
+        (svc, s3_state, disk, tmp)
     }
 
     fn create_s3_stream(svc: &FirehoseService, name: &str, bucket: &str) {
@@ -1871,11 +2322,11 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn snappy_delivery_uses_the_modeled_enum_and_xerial_metadata() {
+    #[tokio::test]
+    async fn snappy_delivery_uses_the_modeled_enum_and_xerial_metadata() {
         use crate::test_xerial_decoder::{decode, multiblock_input};
 
-        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-snappy");
+        let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-snappy");
         create_s3_stream_with_compression(&svc, "snappy", "fh-snappy", Some("Snappy"));
         let input = multiblock_input();
         svc.deliver_records(
@@ -1885,7 +2336,8 @@ mod tests {
             vec![b"abc".to_vec(), b"def\n".to_vec(), input.clone()],
         )
         .unwrap();
-        let s3 = svc.s3.as_ref().unwrap().read();
+        assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
+        let s3 = s3_state.read();
         let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-snappy"];
         assert_eq!(bucket.objects.len(), 1);
         let object = bucket.objects.values().next().unwrap();
@@ -1904,11 +2356,11 @@ mod tests {
         assert_eq!(&decoded[7..], input);
     }
 
-    #[test]
-    fn gzip_delivery_encodes_bytes_and_persists_metadata() {
+    #[tokio::test]
+    async fn gzip_delivery_encodes_bytes_and_persists_metadata() {
         use std::io::Read;
 
-        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-gzip");
+        let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-gzip");
         create_s3_stream_with_compression(&svc, "gzip", "fh-gzip", Some("GZIP"));
         svc.deliver_records(
             S3_ACCOUNT,
@@ -1917,7 +2369,8 @@ mod tests {
             vec![b"abc".to_vec(), b"def\n".to_vec(), vec![0, 255]],
         )
         .unwrap();
-        let s3 = svc.s3.as_ref().unwrap().read();
+        assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
+        let s3 = s3_state.read();
         let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-gzip"];
         assert_eq!(bucket.objects.len(), 1);
         let object = bucket.objects.values().next().unwrap();
@@ -1942,13 +2395,12 @@ mod tests {
         assert_eq!(disk.open_object_body(&persisted.body).unwrap(), raw);
     }
 
-    #[test]
-    fn gzip_store_failure_keeps_compressed_body_in_memory() {
-        use fakecloud_persistence::{cache::BodyCache, s3::DiskS3Store, BodyRef};
-        use std::io::Read;
+    #[tokio::test]
+    async fn gzip_store_failure_retains_records_without_memory_publication() {
+        use fakecloud_persistence::{cache::BodyCache, s3::DiskS3Store};
 
         for fail_staging in [true, false] {
-            let (svc, _disk, tmp) = firehose_with_disk_s3("fh-fallback");
+            let (svc, s3_state, disk, tmp) = firehose_with_disk_s3("fh-fallback");
             create_s3_stream_with_compression(&svc, "fallback", "fh-fallback", Some("GZIP"));
             if fail_staging {
                 let blocked = tmp.path().join("not-a-directory");
@@ -1972,34 +2424,44 @@ mod tests {
             let response: Value = serde_json::from_slice(response.body.expect_bytes()).unwrap();
             assert!(response["RecordId"].as_str().is_some());
 
-            let s3 = svc.s3.as_ref().unwrap().read();
-            let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-fallback"];
+            let report = svc.delivery_engine().shutdown().await;
             assert_eq!(
-                bucket.objects.len(),
-                1,
-                "failed persistence must retain the session fallback"
+                report,
+                crate::DrainReport {
+                    delivered_batches: 0,
+                    undelivered_records: 1,
+                    undelivered_bytes: 2,
+                }
             );
-            let object = bucket.objects.values().next().unwrap();
-            assert_eq!(object.content_encoding.as_deref(), Some("gzip"));
-            let BodyRef::Memory(raw) = &object.body else {
-                panic!("failed write cannot be disk-backed")
-            };
-            assert_eq!(object.size, raw.len() as u64);
-            let mut decoded = Vec::new();
-            flate2::read::GzDecoder::new(raw.as_ref())
-                .read_to_end(&mut decoded)
-                .unwrap();
-            assert_eq!(decoded, b"\x00\xff");
+            assert_eq!(svc.delivery_engine().shutdown().await, report);
+            let s3 = s3_state.read();
+            let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-fallback"];
+            assert!(
+                bucket.objects.is_empty(),
+                "failed persistence cannot publish a memory fallback"
+            );
+            // The deliberately corrupt objects root makes load skip the bucket;
+            // remove only the blocker before checking durable publication.
+            if !fail_staging {
+                std::fs::remove_file(tmp.path().join("s3/buckets/fh-fallback/objects")).unwrap();
+            }
+            assert!(disk.load().unwrap().buckets["fh-fallback"]
+                .objects
+                .is_empty());
         }
     }
 
-    #[test]
-    fn empty_gzip_delivery_does_not_create_an_object() {
-        let (svc, _disk, _tmp) = firehose_with_disk_s3("fh-empty-gzip");
+    #[tokio::test]
+    async fn empty_gzip_delivery_does_not_create_an_object() {
+        let (svc, s3_state, _disk, _tmp) = firehose_with_disk_s3("fh-empty-gzip");
         create_s3_stream_with_compression(&svc, "empty-gzip", "fh-empty-gzip", Some("GZIP"));
         svc.deliver_records(S3_ACCOUNT, "us-east-1", "empty-gzip", vec![vec![], vec![]])
             .unwrap();
-        let s3 = svc.s3.as_ref().unwrap().read();
+        assert_eq!(
+            svc.delivery_engine().shutdown().await,
+            crate::DrainReport::default()
+        );
+        let s3 = s3_state.read();
         assert!(s3.get(S3_ACCOUNT).unwrap().buckets["fh-empty-gzip"]
             .objects
             .is_empty());
@@ -2008,12 +2470,12 @@ mod tests {
     /// `AppendDelimiterToRecord` runs before compression: every record of an
     /// API or internal delivery, including an empty one (which alone would not
     /// produce a GZIP object), is followed by `\n` inside the GZIP stream.
-    #[test]
-    fn gzip_compresses_records_after_append_delimiter() {
+    #[tokio::test]
+    async fn gzip_compresses_records_after_append_delimiter() {
         use fakecloud_core::delivery::FirehoseDelivery;
         use std::io::Read;
 
-        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-gzip-delim");
+        let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-gzip-delim");
         svc.create_delivery_stream(&request(
             "CreateDeliveryStream",
             json!({
@@ -2022,6 +2484,8 @@ mod tests {
                     "RoleARN": "arn:aws:iam::123456789012:role/fh",
                     "BucketARN": "arn:aws:s3:::fh-gzip-delim",
                     "CompressionFormat": "GZIP",
+                    // Zero interval: each delivery below detaches as its own object.
+                    "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 0},
                     "ProcessingConfiguration": {
                         "Enabled": true,
                         "Processors": [{"Type": "AppendDelimiterToRecord"}]
@@ -2039,15 +2503,15 @@ mod tests {
         .unwrap();
         svc.deliver_records(S3_ACCOUNT, "us-east-1", "gzip-delim", vec![vec![]])
             .unwrap();
-        let hook =
-            crate::FirehoseDeliveryImpl::new(svc.shared_state(), svc.s3.as_ref().unwrap().clone());
+        let hook = crate::FirehoseDeliveryImpl::with_engine(svc.delivery_engine());
         hook.set_s3_store(disk.clone());
         hook.put_record(
             "arn:aws:firehose:us-east-1:123456789012:deliverystream/gzip-delim",
             b"{\"internal\":true}",
         );
+        assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 3);
 
-        let s3 = svc.s3.as_ref().unwrap().read();
+        let s3 = s3_state.read();
         let mut decoded: Vec<Vec<u8>> = s3.get(S3_ACCOUNT).unwrap().buckets["fh-gzip-delim"]
             .objects
             .values()
@@ -2074,9 +2538,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn delivery_preserves_binary_bytes_and_producer_delimiters() {
-        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-bytes");
+    #[tokio::test]
+    async fn delivery_preserves_binary_bytes_and_producer_delimiters() {
+        let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-bytes");
         create_s3_stream(&svc, "verbatim", "fh-bytes");
         svc.deliver_records(
             S3_ACCOUNT,
@@ -2086,7 +2550,8 @@ mod tests {
         )
         .unwrap();
 
-        let s3 = svc.s3.as_ref().unwrap().read();
+        assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
+        let s3 = s3_state.read();
         let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-bytes"];
         assert_eq!(bucket.objects.len(), 1);
         let object = bucket.objects.values().next().unwrap();
@@ -2100,15 +2565,15 @@ mod tests {
         assert_eq!(object.etag, "7d2ae660248a023760f924dd991e2533");
     }
 
-    #[test]
-    fn delivery_names_use_stream_version_utc_and_custom_extension() {
+    #[tokio::test]
+    async fn delivery_names_use_stream_version_utc_and_custom_extension() {
         for (prefix, extension) in [
             (None, None),
             (Some("events/"), Some(".custom.log")),
             (Some("events"), Some("")),
             (Some("../logical/"), Some(".log")),
         ] {
-            let (svc, disk, _tmp) = firehose_with_disk_s3("fh-names");
+            let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-names");
             create_s3_stream(&svc, "named", "fh-names");
             let destination_id = svc
                 .state
@@ -2142,9 +2607,10 @@ mod tests {
             let before = Utc::now();
             svc.deliver_records(S3_ACCOUNT, "us-east-1", "named", vec![b"x".to_vec()])
                 .unwrap();
+            assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
             let after = Utc::now();
 
-            let s3 = svc.s3.as_ref().unwrap().read();
+            let s3 = s3_state.read();
             let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-names"];
             let object = bucket.objects.values().next().unwrap();
             // S3's LastModified is assigned after staging, so it need not share
@@ -2167,21 +2633,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn internal_delivery_preserves_exact_bytes() {
+    #[tokio::test]
+    async fn internal_delivery_preserves_exact_bytes() {
         use fakecloud_core::delivery::FirehoseDelivery;
 
-        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-hook");
+        let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-hook");
         create_s3_stream(&svc, "hook", "fh-hook");
-        let hook =
-            crate::FirehoseDeliveryImpl::new(svc.shared_state(), svc.s3.as_ref().unwrap().clone());
+        let hook = crate::FirehoseDeliveryImpl::with_engine(svc.delivery_engine());
         hook.set_s3_store(disk.clone());
         hook.put_record(
             "arn:aws:firehose:us-east-1:123456789012:deliverystream/hook",
             b"\x00\xff",
         );
 
-        let s3 = svc.s3.as_ref().unwrap().read();
+        assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
+        let s3 = s3_state.read();
         let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-hook"];
         assert_eq!(bucket.objects.len(), 1);
         assert_eq!(
@@ -2192,13 +2658,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_delivery_does_not_create_an_object() {
-        let (svc, _disk, _tmp) = firehose_with_disk_s3("fh-empty");
+    #[tokio::test]
+    async fn empty_delivery_does_not_create_an_object() {
+        let (svc, s3_state, _disk, _tmp) = firehose_with_disk_s3("fh-empty");
         create_s3_stream(&svc, "empty", "fh-empty");
         svc.deliver_records(S3_ACCOUNT, "us-east-1", "empty", vec![vec![], vec![]])
             .unwrap();
-        let s3 = svc.s3.as_ref().unwrap().read();
+        assert_eq!(
+            svc.delivery_engine().shutdown().await,
+            crate::DrainReport::default()
+        );
+        let s3 = s3_state.read();
         assert!(s3.get(S3_ACCOUNT).unwrap().buckets["fh-empty"]
             .objects
             .is_empty());
@@ -2271,6 +2741,7 @@ mod tests {
         assert!(ext.get("FileExtension").is_none(), "{after}");
     }
 
+    /// Zero-interval stream, so every delivery detaches as its own object.
     fn create_stream_with_processing(
         svc: &FirehoseService,
         name: &str,
@@ -2280,6 +2751,7 @@ mod tests {
         let mut destination = json!({
             "RoleARN": "arn:aws:iam::123456789012:role/fh",
             "BucketARN": format!("arn:aws:s3:::{bucket}"),
+            "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 0},
         });
         if !processing.is_null() {
             destination["ProcessingConfiguration"] = processing;
@@ -2292,11 +2764,11 @@ mod tests {
     }
 
     fn delivered_bodies(
-        svc: &FirehoseService,
+        s3_state: &SharedS3State,
         disk: &fakecloud_persistence::s3::DiskS3Store,
         bucket: &str,
     ) -> Vec<Vec<u8>> {
-        let s3 = svc.s3.as_ref().unwrap().read();
+        let s3 = s3_state.read();
         let mut bodies: Vec<Vec<u8>> = s3.get(S3_ACCOUNT).unwrap().buckets[bucket]
             .objects
             .values()
@@ -2309,15 +2781,24 @@ mod tests {
     /// AWS: "If you want to add a new line delimiter between records in objects
     /// that are delivered to Amazon S3, choose AppendDelimiterToRecord as a
     /// processor type." Applied per record (after each one), for API and
-    /// internal (Logs/SES) deliveries alike; other processors are not run.
-    #[test]
-    fn append_delimiter_processor_terminates_every_record() {
+    /// internal (Logs/SES) deliveries alike. A Lambda processor is not run, so
+    /// configuring one alongside it is refused rather than silently skipped.
+    #[tokio::test]
+    async fn append_delimiter_processor_terminates_every_record() {
         use fakecloud_core::delivery::FirehoseDelivery;
 
-        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-delim");
+        let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-delim");
         create_stream_with_processing(
             &svc,
             "delim",
+            "fh-delim",
+            json!({"Enabled": true, "Processors": [
+                {"Type": "AppendDelimiterToRecord", "Parameters": [{"ParameterName": "Delimiter", "ParameterValue": "\\n"}]}
+            ]}),
+        );
+        create_stream_with_processing(
+            &svc,
+            "lambda-delim",
             "fh-delim",
             json!({"Enabled": true, "Processors": [
                 {"Type": "Lambda", "Parameters": [{"ParameterName": "LambdaArn", "ParameterValue": "arn:aws:lambda:us-east-1:123456789012:function:f"}]},
@@ -2333,16 +2814,33 @@ mod tests {
         .unwrap();
         svc.deliver_records(S3_ACCOUNT, "us-east-1", "delim", vec![vec![]])
             .unwrap();
-        let hook =
-            crate::FirehoseDeliveryImpl::new(svc.shared_state(), svc.s3.as_ref().unwrap().clone());
+        let error = svc
+            .deliver_records(S3_ACCOUNT, "us-east-1", "lambda-delim", vec![b"x".to_vec()])
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(error.code(), "NotImplemented");
+        let hook = crate::FirehoseDeliveryImpl::with_engine(svc.delivery_engine());
         hook.set_s3_store(disk.clone());
         hook.put_record(
             "arn:aws:firehose:us-east-1:123456789012:deliverystream/delim",
             b"{\"internal\":true}",
         );
+        // The internal hook cannot surface the 501; it drops the record.
+        hook.put_record(
+            "arn:aws:firehose:us-east-1:123456789012:deliverystream/lambda-delim",
+            b"{\"internal\":\"lambda\"}",
+        );
 
         assert_eq!(
-            delivered_bodies(&svc, &disk, "fh-delim"),
+            svc.delivery_engine().shutdown().await,
+            crate::DrainReport {
+                delivered_batches: 3,
+                undelivered_records: 0,
+                undelivered_bytes: 0,
+            }
+        );
+        assert_eq!(
+            delivered_bodies(&s3_state, &disk, "fh-delim"),
             vec![
                 b"\n".to_vec(),
                 b"a\nb\n\n\x00\xff\n".to_vec(),
@@ -2351,16 +2849,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn append_delimiter_requires_an_enabled_processing_configuration() {
+    #[tokio::test]
+    async fn append_delimiter_requires_an_enabled_processing_configuration() {
         for processing in [
             Value::Null,
             json!({"Enabled": false, "Processors": [{"Type": "AppendDelimiterToRecord"}]}),
             json!({"Processors": [{"Type": "AppendDelimiterToRecord"}]}),
-            json!({"Enabled": true, "Processors": [{"Type": "Lambda"}]}),
-            json!({"Enabled": true}),
+            json!({"Enabled": false, "Processors": [{"Type": "Lambda"}]}),
         ] {
-            let (svc, disk, _tmp) = firehose_with_disk_s3("fh-raw");
+            let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-raw");
             create_stream_with_processing(&svc, "raw", "fh-raw", processing.clone());
             svc.deliver_records(
                 S3_ACCOUNT,
@@ -2369,19 +2866,44 @@ mod tests {
                 vec![b"a".to_vec(), b"b".to_vec()],
             )
             .unwrap();
+            assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
             assert_eq!(
-                delivered_bodies(&svc, &disk, "fh-raw"),
+                delivered_bodies(&s3_state, &disk, "fh-raw"),
                 vec![b"ab".to_vec()],
                 "{processing}"
             );
         }
+        // Enabled processing without an AppendDelimiterToRecord processor is
+        // not run, and is not silently delivered raw either.
+        for processing in [
+            json!({"Enabled": true, "Processors": [{"Type": "Lambda"}]}),
+            json!({"Enabled": true}),
+        ] {
+            let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-raw");
+            create_stream_with_processing(&svc, "raw", "fh-raw", processing.clone());
+            let error = svc
+                .deliver_records(
+                    S3_ACCOUNT,
+                    "us-east-1",
+                    "raw",
+                    vec![b"a".to_vec(), b"b".to_vec()],
+                )
+                .unwrap_err();
+            assert_eq!(error.status(), StatusCode::NOT_IMPLEMENTED, "{processing}");
+            assert_eq!(error.code(), "NotImplemented");
+            assert_eq!(
+                svc.delivery_engine().shutdown().await,
+                crate::DrainReport::default()
+            );
+            assert!(delivered_bodies(&s3_state, &disk, "fh-raw").is_empty());
+        }
     }
 
-    #[test]
-    fn put_record_writes_through_to_durable_s3_store() {
+    #[tokio::test]
+    async fn put_record_writes_through_to_durable_s3_store() {
         use fakecloud_persistence::{BodyRef, S3Store};
 
-        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+        let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
         create_s3_stream(&svc, "logs-to-s3", "fh-bucket");
 
         let payload = b"event-line".to_vec();
@@ -2405,7 +2927,8 @@ mod tests {
         // The delivered object's in-memory body must be the store's canonical
         // disk-backed ref (proof the write went through the store, not just RAM),
         // and the backing file must exist on disk.
-        let s3 = svc.s3.as_ref().unwrap().read();
+        assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
+        let s3 = s3_state.read();
         let acct = s3.get(S3_ACCOUNT).unwrap();
         let bucket = acct.buckets.get("fh-bucket").unwrap();
         assert_eq!(bucket.objects.len(), 1, "exactly one delivered object");
@@ -2431,15 +2954,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn put_record_to_missing_bucket_is_accepted_but_delivers_nothing() {
+    #[tokio::test]
+    async fn put_record_to_missing_bucket_is_accepted_and_retained() {
         // AWS accepts PutRecord into the delivery buffer and reports delivery
         // failures asynchronously (never as an API error), so a stream whose
         // destination bucket is absent still returns 200 + RecordId. The record
-        // simply lands nowhere (a warn is logged for observability). This is the
-        // behavior the conformance baseline asserts; the emulator must match it
-        // rather than fabricate a synchronous error.
-        let (svc, _disk, _tmp) = firehose_with_disk_s3("real-bucket");
+        // stays buffered for retry instead of fabricating a synchronous error.
+        let (svc, s3_state, _disk, _tmp) = firehose_with_disk_s3("real-bucket");
         create_s3_stream(&svc, "broken-stream", "ghost-bucket");
 
         let resp = svc
@@ -2461,7 +2982,15 @@ mod tests {
 
         // The record could not be delivered, so the existing (different) bucket
         // stays empty — nothing was written anywhere.
-        let s3 = svc.s3.as_ref().unwrap().read();
+        assert_eq!(
+            svc.delivery_engine().shutdown().await,
+            crate::DrainReport {
+                delivered_batches: 0,
+                undelivered_records: 1,
+                undelivered_bytes: 1,
+            }
+        );
+        let s3 = s3_state.read();
         let real = s3
             .get(S3_ACCOUNT)
             .unwrap()
@@ -2495,10 +3024,9 @@ mod tests {
             "arn:aws-cn:firehose:cn-north-1:123456789012:deliverystream/cn-fh"
         );
         assert_eq!(
-            bucket_name_from_arn("arn:aws-cn:s3:::cn-bucket"),
+            fakecloud_aws::arn::arn_resource("arn:aws-cn:s3:::cn-bucket", "s3")
+                .and_then(|r| r.strip_prefix("::")),
             Some("cn-bucket")
         );
-        assert_eq!(bucket_name_from_arn("arn:aws:s3:::bucket"), Some("bucket"));
-        assert_eq!(bucket_name_from_arn("arn:aws-cn:sqs:cn-north-1:1:q"), None);
     }
 }

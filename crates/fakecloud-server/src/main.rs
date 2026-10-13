@@ -1367,18 +1367,17 @@ async fn main() {
         s3_state.clone(),
     ));
     let s3_delivery_for_rds = s3_delivery_for_logs.clone();
-    // Firehose state is constructed once and shared between the public
-    // FirehoseService (registered later) and the cross-service delivery
-    // hook the Logs subscription dispatch uses for `arn:aws:firehose:`
-    // destinations. Building it here keeps the wiring in one place.
+    // One inert engine owns admission for the public API and Logs/SES hooks.
     let firehose_state: fakecloud_firehose::SharedFirehoseState = Arc::new(
         parking_lot::RwLock::new(fakecloud_firehose::FirehoseAccounts::new()),
     );
-    let firehose_delivery_for_logs =
-        Arc::new(fakecloud_firehose::delivery::FirehoseDeliveryImpl::new(
-            firehose_state.clone(),
-            s3_state.clone(),
-        ));
+    let firehose_engine = Arc::new(fakecloud_firehose::FirehoseEngine::new(
+        firehose_state.clone(),
+    ));
+    firehose_engine.set_s3(s3_state.clone());
+    let firehose_delivery_for_logs = Arc::new(
+        fakecloud_firehose::FirehoseDeliveryImpl::with_engine(firehose_engine.clone()),
+    );
     let cloudwatch_delivery_for_logs = Arc::new(fakecloud_cloudwatch::CloudwatchDeliveryImpl::new(
         cloudwatch_state.clone(),
     ));
@@ -2673,7 +2672,7 @@ async fn main() {
     // The CloudWatch-Logs -> Firehose -> S3 delivery hook was built before the
     // S3 store existed; wire the store now so records it delivers are written
     // through to disk (they would otherwise be lost on restart).
-    firehose_delivery_for_logs.set_s3_store(s3_store.clone());
+    firehose_engine.set_s3_store(s3_store.clone());
     // Same for the shared S3 delivery impl (CloudWatch Logs export/deliveries +
     // RDS S3 exports go through this Arc): route its writes through the durable
     // store so delivered objects survive a restart.
@@ -4179,8 +4178,7 @@ async fn main() {
             None
         };
     let mut firehose_service = fakecloud_firehose::FirehoseService::new(firehose_state.clone())
-        .with_s3(s3_state.clone())
-        .with_s3_store(s3_store.clone());
+        .with_engine(firehose_engine.clone());
     if let Some(store) = firehose_snapshot_store.clone() {
         firehose_service = firehose_service.with_snapshot_store(store);
     }
@@ -12742,13 +12740,31 @@ async fn main() {
         };
         tokio::spawn(dns::run(dns_cfg, cli.dns_addr()));
     }
-    axum::serve(
+    firehose_engine
+        .start()
+        .expect("Firehose engine starts once after stores and snapshots load");
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
-    .await
-    .unwrap();
+    .await;
+    // Axum has finished active requests. Close internal admission and drain
+    // before runtime cleanup can emit late logs or release S3 dependencies.
+    let report = firehose_engine.shutdown().await;
+    if report.undelivered_records != 0 {
+        tracing::warn!(
+            delivered_batches = report.delivered_batches,
+            undelivered_records = report.undelivered_records,
+            undelivered_bytes = report.undelivered_bytes,
+            "Firehose shutdown retained undelivered data"
+        );
+    } else {
+        tracing::info!(
+            delivered_batches = report.delivered_batches,
+            "Firehose shutdown drained"
+        );
+    }
     // Clean up Lambda containers on shutdown
     if let Some(rt) = container_runtime {
         rt.stop_all().await;
@@ -12774,6 +12790,7 @@ async fn main() {
     if let Some(cli) = fakecloud_core::container_net::detect_container_cli() {
         fakecloud_core::data_volume::remove_process_volumes(&cli).await;
     }
+    serve_result.expect("HTTP server failed");
 }
 
 /// Look up a Lambda artifact (function code, layer content) of `account_id`

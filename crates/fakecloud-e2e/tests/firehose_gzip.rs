@@ -2,8 +2,8 @@ use std::io::Read;
 
 use aws_sdk_firehose::primitives::Blob;
 use aws_sdk_firehose::types::{
-    CompressionFormat, ExtendedS3DestinationConfiguration, ProcessingConfiguration, Processor,
-    ProcessorType, Record, S3DestinationConfiguration,
+    BufferingHints, CompressionFormat, ExtendedS3DestinationConfiguration, ProcessingConfiguration,
+    Processor, ProcessorType, Record, S3DestinationConfiguration,
 };
 use base64::Engine;
 use fakecloud_testkit::TestServer;
@@ -29,13 +29,23 @@ async fn gzip_object(
     prefix: &str,
     extension: &str,
 ) -> (String, Vec<u8>, Vec<u8>) {
-    let listing = s3
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(prefix)
-        .send()
-        .await
-        .unwrap();
+    let listing = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let listing = s3
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix)
+                .send()
+                .await
+                .unwrap();
+            if !listing.contents().is_empty() {
+                return listing;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Firehose GZIP object within 10s");
     assert_eq!(listing.contents().len(), 1);
     assert_eq!(
         listing.contents()[0]
@@ -128,6 +138,12 @@ async fn firehose_gzip_batch_preserves_bytes_and_extension_overrides() {
                 S3DestinationConfiguration::builder()
                     .role_arn("arn:aws:iam::123456789012:role/firehose")
                     .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                    .buffering_hints(
+                        BufferingHints::builder()
+                            .size_in_mbs(5)
+                            .interval_in_seconds(0)
+                            .build(),
+                    )
                     .compression_format(CompressionFormat::Gzip)
                     .build()
                     .unwrap(),
@@ -138,6 +154,12 @@ async fn firehose_gzip_batch_preserves_bytes_and_extension_overrides() {
                 ExtendedS3DestinationConfiguration::builder()
                     .role_arn("arn:aws:iam::123456789012:role/firehose")
                     .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                    .buffering_hints(
+                        BufferingHints::builder()
+                            .size_in_mbs(5)
+                            .interval_in_seconds(0)
+                            .build(),
+                    )
                     .compression_format(CompressionFormat::Gzip)
                     .set_file_extension(extension.map(str::to_owned))
                     .build()
@@ -177,6 +199,14 @@ async fn firehose_gzip_compresses_records_after_append_delimiter() {
             ExtendedS3DestinationConfiguration::builder()
                 .role_arn("arn:aws:iam::123456789012:role/firehose")
                 .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                // Zero interval: the batch is due at admission; the helper
+                // polls for the asynchronous write.
+                .buffering_hints(
+                    BufferingHints::builder()
+                        .size_in_mbs(5)
+                        .interval_in_seconds(0)
+                        .build(),
+                )
                 .compression_format(CompressionFormat::Gzip)
                 .processing_configuration(
                     ProcessingConfiguration::builder()
@@ -225,6 +255,12 @@ async fn firehose_gzip_public_and_internal_objects_survive_restart() {
                 ExtendedS3DestinationConfiguration::builder()
                     .role_arn("arn:aws:iam::123456789012:role/firehose")
                     .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                    .buffering_hints(
+                        BufferingHints::builder()
+                            .size_in_mbs(5)
+                            .interval_in_seconds(0)
+                            .build(),
+                    )
                     .prefix(prefix)
                     .compression_format(CompressionFormat::Gzip)
                     .build()

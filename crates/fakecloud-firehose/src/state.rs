@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 pub type SharedFirehoseState = Arc<RwLock<FirehoseAccounts>>;
 
@@ -67,8 +68,18 @@ pub struct FirehoseSnapshot {
 
 pub const FIREHOSE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct StreamKey {
+    pub account_id: String,
+    pub region: String,
+    pub name: String,
+    pub instance_id: Uuid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryStream {
+    #[serde(skip, default = "Uuid::new_v4")]
+    pub instance_id: Uuid,
     pub name: String,
     pub arn: String,
     pub status: String,
@@ -145,4 +156,45 @@ pub struct S3Destination {
     /// `S3BackupDescription`. Distinct from the `s3_backup_mode` string.
     #[serde(default)]
     pub s3_backup_description: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn legacy_stream() -> serde_json::Value {
+        json!({"name": "events", "arn": "arn:aws:firehose:us-east-1:123456789012:deliverystream/events", "status": "ACTIVE", "stream_type": "DirectPut", "created_at": "2026-10-12T00:00:00Z", "last_update": "2026-10-12T00:00:00Z", "version_id": "1", "destination": null, "tags": {}})
+    }
+
+    #[test]
+    fn instance_identity() {
+        let stream: DeliveryStream = serde_json::from_value(legacy_stream()).unwrap();
+        assert_eq!(stream.clone().instance_id, stream.instance_id);
+        let serialized = serde_json::to_value(&stream).unwrap();
+        assert!(serialized.get("instance_id").is_none());
+        let restored: DeliveryStream = serde_json::from_value(serialized.clone()).unwrap();
+        let restored_again: DeliveryStream = serde_json::from_value(serialized).unwrap();
+        assert_ne!(stream.instance_id, restored.instance_id);
+        assert_ne!(restored.instance_id, restored_again.instance_id);
+        assert_eq!(FIREHOSE_SNAPSHOT_SCHEMA_VERSION, 1);
+        let key = StreamKey {
+            account_id: "123456789012".into(),
+            region: "us-east-1".into(),
+            name: stream.name.clone(),
+            instance_id: stream.instance_id,
+        };
+        assert_eq!(key.clone(), key);
+        assert_ne!(
+            key,
+            StreamKey {
+                instance_id: restored.instance_id,
+                ..key.clone()
+            }
+        );
+        let mut keys = std::collections::BTreeSet::new();
+        keys.insert(key.clone());
+        keys.insert(key);
+        assert_eq!(keys.len(), 1);
+    }
 }

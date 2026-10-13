@@ -1,7 +1,7 @@
 use aws_sdk_firehose::primitives::Blob;
 use aws_sdk_firehose::types::{
-    CompressionFormat, ExtendedS3DestinationConfiguration, ProcessingConfiguration, Processor,
-    ProcessorType, Record,
+    BufferingHints, CompressionFormat, ExtendedS3DestinationConfiguration, ProcessingConfiguration,
+    Processor, ProcessorType, Record,
 };
 use fakecloud_testkit::TestServer;
 
@@ -13,7 +13,17 @@ async fn snappy_object(
     bucket: &str,
     extension: &str,
 ) -> (String, Vec<u8>, Vec<u8>) {
-    let listing = s3.list_objects_v2().bucket(bucket).send().await.unwrap();
+    let listing = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let listing = s3.list_objects_v2().bucket(bucket).send().await.unwrap();
+            if !listing.contents().is_empty() {
+                return listing;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Firehose Snappy object within 10s");
     assert_eq!(listing.contents().len(), 1);
     assert_eq!(
         listing.contents()[0]
@@ -88,6 +98,12 @@ async fn firehose_snappy_binary_multiblock_and_extension_overrides() {
                 ExtendedS3DestinationConfiguration::builder()
                     .role_arn("arn:aws:iam::123456789012:role/firehose")
                     .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                    .buffering_hints(
+                        BufferingHints::builder()
+                            .size_in_mbs(5)
+                            .interval_in_seconds(0)
+                            .build(),
+                    )
                     .compression_format(CompressionFormat::Snappy)
                     .set_file_extension(extension.map(str::to_owned))
                     .build()
@@ -151,6 +167,14 @@ async fn firehose_snappy_delimiters_share_block_windows() {
             ExtendedS3DestinationConfiguration::builder()
                 .role_arn("arn:aws:iam::123456789012:role/firehose")
                 .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                // Zero interval: the batch is due at admission; the helper
+                // polls for the asynchronous write.
+                .buffering_hints(
+                    BufferingHints::builder()
+                        .size_in_mbs(5)
+                        .interval_in_seconds(0)
+                        .build(),
+                )
                 .compression_format(CompressionFormat::Snappy)
                 .processing_configuration(
                     ProcessingConfiguration::builder()
@@ -209,6 +233,12 @@ async fn firehose_snappy_object_and_configuration_survive_restart() {
             ExtendedS3DestinationConfiguration::builder()
                 .role_arn("arn:aws:iam::123456789012:role/firehose")
                 .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                .buffering_hints(
+                    BufferingHints::builder()
+                        .size_in_mbs(5)
+                        .interval_in_seconds(0)
+                        .build(),
+                )
                 .prefix("events/")
                 .compression_format(CompressionFormat::Snappy)
                 .build()

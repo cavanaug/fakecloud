@@ -3,6 +3,23 @@ use aws_sdk_firehose::types::{BufferingHints, ExtendedS3DestinationConfiguration
 use aws_sdk_s3::types::CreateBucketConfiguration;
 use fakecloud_testkit::TestServer;
 
+async fn wait_objects(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+) -> aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let listing = s3.list_objects_v2().bucket(bucket).send().await.unwrap();
+            if !listing.contents().is_empty() {
+                return listing;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Firehose object within 10s")
+}
+
 async fn setup(server: &TestServer, bucket: &str) -> aws_sdk_firehose::Client {
     let s3 = server.s3_client().await;
     let _ = s3
@@ -25,7 +42,7 @@ fn ext_s3(bucket_arn: &str) -> ExtendedS3DestinationConfiguration {
         .buffering_hints(
             BufferingHints::builder()
                 .size_in_mbs(5)
-                .interval_in_seconds(60)
+                .interval_in_seconds(0)
                 .build(),
         )
         .build()
@@ -208,12 +225,8 @@ async fn firehose_put_record_writes_to_s3() {
         .expect("put record");
 
     let s3 = server.s3_client().await;
-    let listing = s3
-        .list_objects_v2()
-        .bucket("fh-bucket-put")
-        .send()
-        .await
-        .expect("list");
+    let listing = wait_objects(&s3, "fh-bucket-put").await;
+    assert_eq!(listing.contents().len(), 1);
     let key = listing
         .contents()
         .first()
@@ -259,12 +272,7 @@ async fn firehose_put_record_batch_aggregates_payloads() {
     assert_eq!(resp.request_responses().len(), 3);
 
     let s3 = server.s3_client().await;
-    let listing = s3
-        .list_objects_v2()
-        .bucket("fh-bucket-batch")
-        .send()
-        .await
-        .expect("list");
+    let listing = wait_objects(&s3, "fh-bucket-batch").await;
     let key = listing
         .contents()
         .first()
@@ -310,6 +318,12 @@ async fn firehose_s3_static_prefixes_extensions_and_utc_names() {
                 ExtendedS3DestinationConfiguration::builder()
                     .role_arn("arn:aws:iam::123456789012:role/firehose")
                     .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                    .buffering_hints(
+                        BufferingHints::builder()
+                            .size_in_mbs(5)
+                            .interval_in_seconds(0)
+                            .build(),
+                    )
                     .set_prefix(prefix.map(str::to_owned))
                     .set_file_extension(extension.map(str::to_owned))
                     .build()
@@ -326,9 +340,8 @@ async fn firehose_s3_static_prefixes_extensions_and_utc_names() {
             .send()
             .await
             .unwrap();
+        let listing = wait_objects(&s3, &bucket).await;
         let after = chrono::Utc::now();
-
-        let listing = s3.list_objects_v2().bucket(&bucket).send().await.unwrap();
         assert_eq!(listing.contents().len(), 1);
         // Single-part S3 objects carry the quoted MD5 of their bytes.
         let md5_etag = "\"d07d34efac6328007ad67c7e0a985e00\"";
@@ -342,7 +355,10 @@ async fn firehose_s3_static_prefixes_extensions_and_utc_names() {
             .expect("AWS suffix timestamp")
             .and_utc();
         assert!((before.timestamp()..=after.timestamp()).contains(&time.timestamp()));
-        assert_eq!(hierarchy, time.format("%Y/%m/%d/%H/").to_string());
+        assert!(
+            hierarchy == before.format("%Y/%m/%d/%H/").to_string()
+                || hierarchy == after.format("%Y/%m/%d/%H/").to_string()
+        );
         let uuid = uuid_and_extension
             .strip_prefix('-')
             .unwrap()
@@ -414,12 +430,7 @@ async fn firehose_destination_update_changes_output_version_and_extension() {
         .await
         .unwrap();
     let s3 = server.s3_client().await;
-    let listing = s3
-        .list_objects_v2()
-        .bucket("fh-update-output")
-        .send()
-        .await
-        .unwrap();
+    let listing = wait_objects(&s3, "fh-update-output").await;
     assert_eq!(listing.contents().len(), 1);
     let key = listing.contents()[0].key().unwrap();
     assert!(key.starts_with("updated/"));
@@ -722,14 +733,16 @@ async fn firehose_invalid_file_extension_is_rejected() {
 }
 
 /// `AppendDelimiterToRecord` adds `\n` after every record of an enabled
-/// processing configuration; disabling the configuration stops it, and other
-/// processors in the same configuration are not run.
+/// processing configuration and disabling the configuration stops it. A Lambda
+/// processor is not run, so enabling one alongside the delimiter is refused
+/// with HTTP 501 before acknowledgment instead of silently skipping it.
 #[tokio::test]
 async fn firehose_append_delimiter_to_record_processor() {
     use aws_sdk_firehose::types::{
         ExtendedS3DestinationUpdate, ProcessingConfiguration, Processor, ProcessorParameter,
         ProcessorParameterName, ProcessorType,
     };
+    use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
     let server = TestServer::start().await;
     let firehose = setup(&server, "fh-delimiter").await;
@@ -751,6 +764,14 @@ async fn firehose_append_delimiter_to_record_processor() {
             ExtendedS3DestinationConfiguration::builder()
                 .role_arn("arn:aws:iam::123456789012:role/firehose")
                 .bucket_arn("arn:aws:s3:::fh-delimiter")
+                // Zero interval: each call's records detach at admission with
+                // the stream version current at that moment.
+                .buffering_hints(
+                    BufferingHints::builder()
+                        .size_in_mbs(5)
+                        .interval_in_seconds(0)
+                        .build(),
+                )
                 .processing_configuration(
                     ProcessingConfiguration::builder()
                         .enabled(true)
@@ -812,7 +833,7 @@ async fn firehose_append_delimiter_to_record_processor() {
     .await
     .unwrap();
     put_batch(&[b"c", b"d"]).await.unwrap();
-    // Version 3: re-enabled alongside a Lambda processor -> only the delimiter.
+    // Version 3: re-enabled alongside a Lambda processor -> 501, nothing admitted.
     update(
         ProcessingConfiguration::builder()
             .enabled(true)
@@ -829,26 +850,56 @@ async fn firehose_append_delimiter_to_record_processor() {
                     .build()
                     .unwrap(),
             )
-            .processors(append_delimiter)
+            .processors(append_delimiter.clone())
             .build(),
         "2",
+    )
+    .await
+    .unwrap();
+    let error = put_batch(&[b"lambda"]).await.unwrap_err();
+    assert_eq!(error.raw_response().unwrap().status().as_u16(), 501);
+    assert_eq!(
+        error.as_service_error().unwrap().code(),
+        Some("NotImplemented")
+    );
+    // Version 4: the delimiter alone again -> delivered.
+    update(
+        ProcessingConfiguration::builder()
+            .enabled(true)
+            .processors(append_delimiter)
+            .build(),
+        "3",
     )
     .await
     .unwrap();
     put_batch(&[b"e"]).await.unwrap();
 
     let s3 = server.s3_client().await;
-    let listing = s3
-        .list_objects_v2()
-        .bucket("fh-delimiter")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(listing.contents().len(), 3);
+    let listing = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let listing = s3
+                .list_objects_v2()
+                .bucket("fh-delimiter")
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                listing.contents().len() <= 3,
+                "unexpected extra objects: {:?}",
+                listing.contents()
+            );
+            if listing.contents().len() == 3 {
+                return listing;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("three delimiter-test objects within 10s");
     for (version, expected) in [
         ("1", &b"a\nb\n\n\x00\xff\n"[..]),
         ("2", &b"cd"[..]),
-        ("3", &b"e\n"[..]),
+        ("4", &b"e\n"[..]),
     ] {
         let key = listing
             .contents()

@@ -4242,60 +4242,9 @@ fn parse_cognito_account_recovery(
 }
 
 fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destination, String> {
-    let role_arn = value
-        .get("RoleARN")
-        .and_then(|v| v.as_str())
-        .ok_or("S3 destination requires RoleARN")?
-        .to_string();
-    let bucket_arn = value
-        .get("BucketARN")
-        .and_then(|v| v.as_str())
-        .ok_or("S3 destination requires BucketARN")?
-        .to_string();
-    let prefix = value
-        .get("Prefix")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let error_output_prefix = value
-        .get("ErrorOutputPrefix")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let mut buffering_size_mb = None;
-    let mut buffering_interval_seconds = None;
-    if let Some(hints) = value.get("BufferingHints") {
-        buffering_size_mb = hints.get("SizeInMBs").and_then(|v| v.as_i64());
-        buffering_interval_seconds = hints.get("IntervalInSeconds").and_then(|v| v.as_i64());
-    }
-    let compression_format = value
-        .get("CompressionFormat")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    // Same FileExtension rules as CreateDeliveryStream / UpdateDestination.
-    fakecloud_firehose::validate_s3_file_extension(value).map_err(|e| e.to_string())?;
-    let file_extension = value
-        .get("FileExtension")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    Ok(S3Destination {
-        destination_id: "destination-1".to_string(),
-        role_arn,
-        bucket_arn,
-        prefix,
-        error_output_prefix,
-        buffering_size_mb,
-        buffering_interval_seconds,
-        compression_format,
-        processing_configuration: None,
-        data_format_conversion_configuration: None,
-        cloudwatch_logging_options: None,
-        custom_time_zone: None,
-        s3_backup_mode: None,
-        file_extension,
-        dynamic_partitioning_configuration: None,
-        encryption_configuration: None,
-        s3_backup_description: None,
-    })
+    fakecloud_firehose::config::parse_s3_destination(value)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "S3 destination requires RoleARN and BucketARN".to_string())
 }
 
 #[cfg(test)]

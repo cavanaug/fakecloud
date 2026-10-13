@@ -1049,6 +1049,116 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn firehose_reset_invalidates_old_generation_and_preserves_other_account() {
+        use fakecloud_firehose::{DeliveryStream, DrainReport, FirehoseEngine};
+        use fakecloud_persistence::BodyRef;
+        const FIRST: &str = "123456789012";
+        const OTHER: &str = "222222222222";
+        for mode in ["account", "service", "all"] {
+            let state = test_state();
+            let (late, _) = counting_late(swf_state());
+            assert!(state.late.set(late).is_ok());
+            let insert_stream = |account: &str| {
+                let mut stream: DeliveryStream = serde_json::from_value(serde_json::json!({
+                    "name": "events", "arn": "arn", "status": "ACTIVE", "stream_type": "DirectPut",
+                    "created_at": "2026-10-12T00:00:00Z", "last_update": "2026-10-12T00:00:00Z",
+                    "version_id": "1", "destination": null, "tags": {}
+                }))
+                .unwrap();
+                stream.destination =
+                    fakecloud_firehose::config::parse_s3_destination(&serde_json::json!({
+                        "RoleARN": "role", "BucketARN": "arn:aws:s3:::bucket",
+                        "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 0}
+                    }))
+                    .unwrap();
+                let id = stream.instance_id;
+                state
+                    .firehose
+                    .write()
+                    .get_or_create(account, "us-east-1")
+                    .streams_mut("us-east-1")
+                    .insert("events".into(), stream);
+                id
+            };
+            let insert_bucket = |account: &str| {
+                state.s3.write().get_or_create(account).buckets.insert(
+                    "bucket".into(),
+                    fakecloud_s3::S3Bucket::new("bucket", "us-east-1", "owner"),
+                );
+            };
+            let old_id = insert_stream(FIRST);
+            insert_stream(OTHER);
+            insert_bucket(FIRST);
+            insert_bucket(OTHER);
+            let engine = Arc::new(FirehoseEngine::new(state.firehose.clone()));
+            engine.set_s3(state.s3.clone());
+            engine
+                .enqueue(
+                    FIRST,
+                    "us-east-1",
+                    "events",
+                    vec![bytes::Bytes::from_static(b"stale")],
+                )
+                .unwrap();
+            engine
+                .enqueue(
+                    OTHER,
+                    "us-east-1",
+                    "events",
+                    vec![bytes::Bytes::from_static(b"other")],
+                )
+                .unwrap();
+            let teardown = match mode {
+                "account" => state.reset_service_for_account("firehose", FIRST).unwrap(),
+                "service" => state.reset_service("firehose").unwrap(),
+                _ => state.reset().1,
+            };
+            // Synchronous reset invalidates eligibility before async teardown.
+            assert!(state.firehose.read().get(FIRST).is_none());
+            let new_id = insert_stream(FIRST);
+            assert_ne!(old_id, new_id);
+            if mode == "all" {
+                insert_bucket(FIRST);
+                insert_bucket(OTHER);
+            }
+            teardown.run().await;
+            engine
+                .enqueue(
+                    FIRST,
+                    "us-east-1",
+                    "events",
+                    vec![bytes::Bytes::from_static(b"new")],
+                )
+                .unwrap();
+            assert_eq!(
+                engine.shutdown().await,
+                DrainReport {
+                    delivered_batches: if mode == "account" { 2 } else { 1 },
+                    undelivered_records: 0,
+                    undelivered_bytes: 0,
+                }
+            );
+            let s3 = state.s3.read();
+            let first = &s3.get(FIRST).unwrap().buckets["bucket"].objects;
+            assert_eq!(first.len(), 1);
+            let BodyRef::Memory(body) = &first.values().next().unwrap().body else {
+                panic!("memory fixture")
+            };
+            assert_eq!(body.as_ref(), b"new");
+            let other = &s3.get(OTHER).unwrap().buckets["bucket"].objects;
+            if mode == "account" {
+                assert_eq!(other.len(), 1);
+                let BodyRef::Memory(body) = &other.values().next().unwrap().body else {
+                    panic!("memory fixture")
+                };
+                assert_eq!(body.as_ref(), b"other");
+            } else {
+                assert!(other.is_empty());
+            }
+        }
+    }
+
     /// A late wiring with SWF registered as a service reset through an entry,
     /// and a counting hook for every key a reset writes.
     fn counting_late(swf: fakecloud_swf::SharedSwfState) -> (LateReset, Counts) {

@@ -2,7 +2,7 @@ mod helpers;
 
 use aws_sdk_firehose::primitives::Blob;
 use aws_sdk_firehose::types::{
-    DeliveryStreamEncryptionConfigurationInput, DeliveryStreamType,
+    CompressionFormat, DeliveryStreamEncryptionConfigurationInput, DeliveryStreamType,
     ExtendedS3DestinationConfiguration, KeyType, Record, Tag,
 };
 use helpers::TestServer;
@@ -118,6 +118,24 @@ async fn persistence_delivered_records_survive_restart() {
         .await
         .expect("create stream");
 
+    // Omitted hints resolve to the real defaults, far above these records.
+    let description = fh
+        .describe_delivery_stream()
+        .delivery_stream_name("durable")
+        .send()
+        .await
+        .unwrap();
+    let hints = description
+        .delivery_stream_description()
+        .unwrap()
+        .destinations()[0]
+        .extended_s3_destination_description()
+        .unwrap()
+        .buffering_hints()
+        .unwrap();
+    assert_eq!(hints.size_in_mbs(), Some(5));
+    assert_eq!(hints.interval_in_seconds(), Some(300));
+
     fh.put_record()
         .delivery_stream_name("durable")
         .record(
@@ -130,6 +148,26 @@ async fn persistence_delivered_records_survive_restart() {
         .await
         .expect("put record");
 
+    fh.put_record()
+        .delivery_stream_name("durable")
+        .record(
+            Record::builder()
+                .data(Blob::new(b"\x00\xff\n"))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(s3
+        .list_objects_v2()
+        .bucket("fh-landing")
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .is_empty());
+    // Graceful restart drains the pending buffer before S3 is reopened.
     server.restart().await;
 
     // After restart S3 is rebuilt from the on-disk store; the delivered object
@@ -141,6 +179,7 @@ async fn persistence_delivered_records_survive_restart() {
         .send()
         .await
         .expect("list");
+    assert_eq!(listing.contents().len(), 1);
     let key = listing
         .contents()
         .first()
@@ -155,9 +194,112 @@ async fn persistence_delivered_records_survive_restart() {
         .send()
         .await
         .expect("get delivered object");
-    assert_eq!(obj.e_tag(), Some("\"54fb147ea78d53414d5d89976f5bd218\""));
+    // The bare MD5 of the one buffered object's body, quoted by GetObject.
+    assert_eq!(obj.e_tag(), Some("\"e7f4596cf35e2ba5f4d73e8635602c95\""));
+    assert_eq!(obj.content_type(), Some("application/octet-stream"));
+    assert_eq!(obj.content_encoding(), None);
     let bytes = obj.body.collect().await.expect("collect").into_bytes();
-    assert_eq!(bytes.as_ref(), b"persist-me");
+    assert_eq!(bytes.as_ref(), b"persist-me\x00\xff\n");
+}
+
+#[tokio::test]
+async fn persistence_shutdown_drains_default_buffer_with_gzip_metadata() {
+    use std::io::Read;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let s3 = server.s3_client().await;
+    s3.create_bucket()
+        .bucket("fh-drain-gzip")
+        .send()
+        .await
+        .unwrap();
+    let fh = server.firehose_client().await;
+    fh.create_delivery_stream()
+        .delivery_stream_name("drain-gzip")
+        .extended_s3_destination_configuration(
+            ExtendedS3DestinationConfiguration::builder()
+                .role_arn("arn:aws:iam::123456789012:role/fh")
+                .bucket_arn("arn:aws:s3:::fh-drain-gzip")
+                .compression_format(CompressionFormat::Gzip)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    fh.put_record_batch()
+        .delivery_stream_name("drain-gzip")
+        .records(
+            Record::builder()
+                .data(Blob::new(b"first\n"))
+                .build()
+                .unwrap(),
+        )
+        .records(Record::builder().data(Blob::new([0, 255])).build().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert!(s3
+        .list_objects_v2()
+        .bucket("fh-drain-gzip")
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .is_empty());
+    server.restart().await;
+    let s3 = server.s3_client().await;
+    let listing = s3
+        .list_objects_v2()
+        .bucket("fh-drain-gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listing.contents().len(), 1);
+    let key = listing.contents()[0].key().unwrap().to_owned();
+    assert!(key.ends_with(".gz"));
+    let object = s3
+        .get_object()
+        .bucket("fh-drain-gzip")
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(object.content_type(), Some("application/octet-stream"));
+    assert_eq!(object.content_encoding(), Some("gzip"));
+    let length = object.content_length().unwrap();
+    let raw = object.body.collect().await.unwrap().into_bytes();
+    assert_eq!(length, raw.len() as i64);
+    assert!(raw.starts_with(&[0x1f, 0x8b, 8]));
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(raw.as_ref())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, b"first\n\x00\xff");
+    // A second restart proves a completed durable object, with no pending
+    // snapshot replay or duplicate shutdown delivery.
+    server.restart().await;
+    let s3 = server.s3_client().await;
+    let listing = s3
+        .list_objects_v2()
+        .bucket("fh-drain-gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listing.contents().len(), 1);
+    assert_eq!(listing.contents()[0].key(), Some(key.as_str()));
+    let object = s3
+        .get_object()
+        .bucket("fh-drain-gzip")
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(object.content_type(), Some("application/octet-stream"));
+    assert_eq!(object.content_encoding(), Some("gzip"));
+    assert_eq!(object.content_length(), Some(length));
+    assert_eq!(object.body.collect().await.unwrap().into_bytes(), raw);
 }
 
 /// DeleteDeliveryStream durability: a deleted stream stays gone after restart.

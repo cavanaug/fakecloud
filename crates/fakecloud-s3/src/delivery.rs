@@ -93,6 +93,25 @@ pub fn put_object_via_store_with_options(
     store: Option<&dyn S3Store>,
     request: DeliveryObjectRequest<'_>,
 ) -> Result<(), String> {
+    put_object_via_store_guarded(state, store, request, || Some(())).map(|_| ())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryWriteOutcome {
+    Committed,
+    Cancelled,
+}
+
+/// Stage and hash without configuration or S3 guards, then authorize the commit.
+/// The callback's returned guard pins the producer's configuration through both
+/// durable commit and memory publication. Lock order: producer configuration, S3.
+/// A cancelled or failed write drops the spool owner to clean up staged bytes.
+pub fn put_object_via_store_guarded<G>(
+    state: &SharedS3State,
+    store: Option<&dyn S3Store>,
+    request: DeliveryObjectRequest<'_>,
+    before_commit: impl FnOnce() -> Option<G>,
+) -> Result<DeliveryWriteOutcome, String> {
     let DeliveryObjectRequest {
         account: account_id,
         bucket,
@@ -124,6 +143,10 @@ pub fn put_object_via_store_with_options(
     })
     .map_err(|e| format!("failed to stage object {key} for bucket {bucket}: {e}"))?;
 
+    let Some(commit_guard) = before_commit() else {
+        return Ok(DeliveryWriteOutcome::Cancelled);
+    };
+
     let mut obj = S3Object {
         key: key.to_string(),
         body: memory_body(bytes),
@@ -139,7 +162,7 @@ pub fn put_object_via_store_with_options(
     };
 
     let mut accounts = state.write();
-    let acct = accounts.get_or_create(account_id);
+    let acct = accounts.get_mut(account_id).ok_or_else(missing)?;
     let bucket_ref = acct.buckets.get_mut(bucket).ok_or_else(missing)?;
     // Write through to the durable store so the delivered object survives a
     // restart (S3 has no state snapshot; it is rebuilt from the store on
@@ -155,7 +178,9 @@ pub fn put_object_via_store_with_options(
         obj.body = returned;
     }
     bucket_ref.objects.insert(key.to_string(), obj);
-    Ok(())
+    drop(accounts);
+    drop(commit_guard);
+    Ok(DeliveryWriteOutcome::Committed)
 }
 
 impl S3Delivery for S3DeliveryImpl {
@@ -225,6 +250,173 @@ mod tests {
             S3Bucket::new("logs-bucket", "us-east-1", "owner-id"),
         );
         Arc::new(RwLock::new(mas))
+    }
+
+    fn disk_store(tmp: &tempfile::TempDir) -> fakecloud_persistence::s3::DiskS3Store {
+        let disk = fakecloud_persistence::s3::DiskS3Store::new(
+            tmp.path().join("s3"),
+            Arc::new(fakecloud_persistence::cache::BodyCache::new(1024)),
+        );
+        disk.put_bucket_meta(
+            "logs-bucket",
+            &fakecloud_persistence::BucketMeta {
+                name: "logs-bucket".into(),
+                region: "us-east-1".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        disk
+    }
+
+    fn guarded_request() -> DeliveryObjectRequest<'static> {
+        DeliveryObjectRequest {
+            account: ACCOUNT,
+            bucket: "logs-bucket",
+            key: "events.gz",
+            body: Bytes::from_static(b"encoded payload"),
+            options: DeliveryObjectOptions {
+                content_type: Some("application/octet-stream".into()),
+                content_encoding: Some("gzip".into()),
+            },
+        }
+    }
+
+    fn staged_path(disk: &dyn S3Store) -> std::path::PathBuf {
+        let paths: Vec<_> = std::fs::read_dir(disk.spool_dir().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 1, "callback must run after real staging");
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"encoded payload");
+        paths[0].clone()
+    }
+
+    #[test]
+    fn guarded_write_carries_encoding_and_durability() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = disk_store(&tmp);
+        let state = shared_state();
+        let outcome = put_object_via_store_guarded(&state, Some(&disk), guarded_request(), || {
+            assert!(state.try_write().is_some(), "staging holds no S3 guard");
+            staged_path(&disk);
+            Some(())
+        })
+        .unwrap();
+        assert_eq!(outcome, DeliveryWriteOutcome::Committed);
+        let accounts = state.read();
+        let object = &accounts.get(ACCOUNT).unwrap().buckets["logs-bucket"].objects["events.gz"];
+        assert!(matches!(
+            object.body,
+            fakecloud_persistence::BodyRef::Disk { .. }
+        ));
+        assert_eq!(object.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(object.size, 15);
+        assert_eq!(
+            disk.open_object_body(&object.body).unwrap(),
+            b"encoded payload"[..]
+        );
+        drop(accounts);
+        let reloaded = disk_store(&tmp).load().unwrap();
+        let object = &reloaded.buckets["logs-bucket"].objects["events.gz"];
+        assert_eq!(object.meta.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(object.meta.content_type, "application/octet-stream");
+        assert_eq!(object.meta.storage_class, "STANDARD");
+        assert_eq!(
+            disk.open_object_body(&object.body).unwrap(),
+            b"encoded payload"[..]
+        );
+    }
+
+    #[test]
+    fn cancelled_commit_publishes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = disk_store(&tmp);
+        let state = shared_state();
+        let mut staged = None;
+        let outcome = put_object_via_store_guarded(&state, Some(&disk), guarded_request(), || {
+            staged = Some(staged_path(&disk));
+            assert!(state.try_write().is_some());
+            None::<()>
+        })
+        .unwrap();
+        assert_eq!(outcome, DeliveryWriteOutcome::Cancelled);
+        assert!(!staged.unwrap().exists());
+        assert!(state.read().get(ACCOUNT).unwrap().buckets["logs-bucket"]
+            .objects
+            .is_empty());
+        assert!(disk.load().unwrap().buckets["logs-bucket"]
+            .objects
+            .is_empty());
+    }
+
+    #[test]
+    fn failed_store_does_not_publish_memory_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = disk_store(&tmp);
+        let state = shared_state();
+        let mut staged = None;
+        let result = put_object_via_store_guarded(&state, Some(&disk), guarded_request(), || {
+            staged = Some(staged_path(&disk));
+            // Staging succeeds; the actual disk commit cannot create its object directory.
+            std::fs::write(
+                tmp.path().join("s3/buckets/logs-bucket/objects"),
+                b"blocked",
+            )
+            .unwrap();
+            Some(())
+        });
+        assert!(result.unwrap_err().contains("failed to persist"));
+        assert!(!staged.unwrap().exists());
+        assert!(state.read().get(ACCOUNT).unwrap().buckets["logs-bucket"]
+            .objects
+            .is_empty());
+        std::fs::remove_file(tmp.path().join("s3/buckets/logs-bucket/objects")).unwrap();
+        assert!(disk.load().unwrap().buckets["logs-bucket"]
+            .objects
+            .is_empty());
+    }
+
+    #[test]
+    fn bucket_removed_after_staging_cleans_up_without_committing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = disk_store(&tmp);
+        let state = shared_state();
+        let mut staged = None;
+        let result = put_object_via_store_guarded(&state, Some(&disk), guarded_request(), || {
+            staged = Some(staged_path(&disk));
+            state.write().get_or_create(ACCOUNT).buckets.clear();
+            Some(())
+        });
+        assert!(result.unwrap_err().contains("not found"));
+        assert!(!staged.unwrap().exists());
+        assert!(disk.load().unwrap().buckets["logs-bucket"]
+            .objects
+            .is_empty());
+    }
+
+    #[test]
+    fn returned_guard_lives_through_memory_publication() {
+        struct PublicationGuard(SharedS3State);
+        impl Drop for PublicationGuard {
+            fn drop(&mut self) {
+                let state = self
+                    .0
+                    .try_read()
+                    .expect("producer guard dropped before S3 publication finished");
+                assert!(state.get(ACCOUNT).unwrap().buckets["logs-bucket"]
+                    .objects
+                    .contains_key("events.gz"));
+            }
+        }
+        let state = shared_state();
+        assert_eq!(
+            put_object_via_store_guarded(&state, None, guarded_request(), || Some(
+                PublicationGuard(state.clone())
+            ),)
+            .unwrap(),
+            DeliveryWriteOutcome::Committed
+        );
     }
 
     #[test]

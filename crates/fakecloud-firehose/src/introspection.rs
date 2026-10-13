@@ -93,6 +93,7 @@ mod tests {
 
     fn stream(account: &str, name: &str, encryption: Option<EncryptionConfig>) -> DeliveryStream {
         DeliveryStream {
+            instance_id: uuid::Uuid::new_v4(),
             name: name.to_string(),
             arn: format!("arn:aws:firehose:us-east-1:{account}:deliverystream/{name}"),
             status: "ACTIVE".to_string(),
