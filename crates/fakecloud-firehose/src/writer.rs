@@ -4,8 +4,8 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use fakecloud_persistence::S3Store;
 use fakecloud_s3::delivery::{
-    put_object_via_store_guarded, DeliveryObjectOptions, DeliveryObjectRequest,
-    DeliveryWriteOutcome,
+    ensure_delivery_bucket, put_object_via_store_guarded, DeliveryObjectOptions,
+    DeliveryObjectRequest, DeliveryWriteOutcome,
 };
 use fakecloud_s3::SharedS3State;
 use parking_lot::RwLock;
@@ -47,6 +47,13 @@ impl S3BatchWriter {
 
 impl BatchWriter for S3BatchWriter {
     fn write(&self, batch: &DeliveryBatch) -> Result<DeliveryWriteOutcome, String> {
+        // A missing bucket is the common persistent failure; detect it before
+        // spending a full encode (up to ~132 MiB) on every retry.
+        ensure_delivery_bucket(
+            &self.s3,
+            &batch.stream.account_id,
+            &batch.destination.bucket,
+        )?;
         let compression = batch.destination.output.compression;
         let body = encode_records(&batch.records, &batch.destination.output)
             .map_err(|e| format!("failed to encode Firehose batch {}: {e}", batch.object_key))?;
@@ -506,6 +513,17 @@ mod tests {
                 config.accounts.clear();
             });
             mutating_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Resume only once the mutation is parked on the configuration lock:
+            // parking_lot refuses new readers as soon as a writer is waiting, so
+            // this cannot pass while the mutation thread is merely scheduled.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while state.try_read().is_some() {
+                assert!(
+                    Instant::now() < deadline,
+                    "mutation never waited for the commit guard"
+                );
+                std::thread::yield_now();
+            }
             resume_tx.send(()).unwrap();
             assert_eq!(
                 writing.join().unwrap().unwrap(),
@@ -514,6 +532,28 @@ mod tests {
             mutation.join().unwrap();
         });
         assert!(state.read().accounts.is_empty());
+    }
+
+    #[test]
+    fn missing_bucket_fails_before_staging_or_commit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, s3, mut batch) = fixture();
+        batch.destination.bucket = "ghost-bucket".into();
+        let disk = disk(&tmp);
+        let spool = disk.spool_dir().unwrap();
+        let store: Arc<dyn S3Store> = Arc::new(BoundaryStore {
+            disk,
+            staging: Some(Box::new(|| panic!("missing bucket reached staging"))),
+            commit: Some(Box::new(|| panic!("missing bucket reached commit"))),
+        });
+        // Staging precedes authorization and commit, so neither hook may run.
+        assert_eq!(
+            writer(&state, &s3, Some(store)).write(&batch),
+            Err(format!(
+                "bucket ghost-bucket not found in account {ACCOUNT}"
+            ))
+        );
+        assert_eq!(std::fs::read_dir(spool).unwrap().count(), 0);
     }
 
     #[test]

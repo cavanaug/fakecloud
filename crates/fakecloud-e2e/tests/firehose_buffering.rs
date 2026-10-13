@@ -250,7 +250,10 @@ async fn firehose_interval_flushes_after_idle_and_starts_new_window() {
     let s3 = server.s3_client().await;
     let bucket = "fh-idle";
     s3.create_bucket().bucket(bucket).send().await.unwrap();
-    create(&fh, bucket, destination(bucket, 2)).await;
+    // Each "not yet" check below has about INTERVAL seconds of margin, while
+    // delivery lands within INTERVAL + one 1 s worker tick, well inside wait_keys.
+    const INTERVAL: i32 = 5;
+    create(&fh, bucket, destination(bucket, INTERVAL)).await;
     let before = chrono::Utc::now();
     put(&fh, bucket, b"first\x00\xff".to_vec()).await;
     let admitted = chrono::Utc::now();
@@ -346,7 +349,7 @@ async fn firehose_api_buffered_update_uses_latest_configuration() {
 }
 
 #[tokio::test]
-async fn firehose_detached_config_survives_update_and_missing_bucket_creation() {
+async fn firehose_detached_batch_keeps_captured_config_until_late_bucket_exists() {
     let server = TestServer::start().await;
     let fh = server.firehose_client().await;
     let s3 = server.s3_client().await;
@@ -380,6 +383,14 @@ async fn firehose_detached_config_survives_update_and_missing_bucket_creation() 
     )
     .await;
     put(&fh, "captured", b"latest-new".to_vec()).await;
+    // Admission wakes the worker at once, so the old batch has almost certainly
+    // failed against the missing bucket by now; exact retry timing is covered by
+    // the engine unit tests.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        keys(&s3, "fh-present-new").await.is_empty(),
+        "a stream's successor must wait behind its failed head"
+    );
     s3.create_bucket()
         .bucket("fh-missing-old")
         .send()
@@ -401,11 +412,13 @@ async fn firehose_detached_config_survives_update_and_missing_bucket_creation() 
         object(&s3, "fh-present-new", &new[0], "Snappy").await,
         b"latest-new"
     );
-    // This proves eventual retained delivery, not a specific failed attempt.
 }
 
+// Proves the old instance's pending data never merges into the recreated
+// stream. Discarding (rather than later delivering) the old buffer is covered by
+// the engine's delete/recreate pruning unit test; its 300 s window outlasts this test.
 #[tokio::test]
-async fn firehose_delete_recreate_discards_old_pending_data() {
+async fn firehose_delete_recreate_does_not_merge_old_pending_data() {
     let server = TestServer::start().await;
     let fh = server.firehose_client().await;
     let s3 = server.s3_client().await;
@@ -567,6 +580,9 @@ async fn firehose_unsupported_update_pauses_accepted_data_until_supported_again(
         .await
         .unwrap_err();
     assert_eq!(error.raw_response().unwrap().status().as_u16(), 501);
+    // The paused data is already due (interval 0). Wait past at least two worker
+    // ticks so a scan that ignored the pause would have written it by now.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
     assert!(keys(&s3, bucket).await.is_empty());
     update(
         &fh,
@@ -577,6 +593,12 @@ async fn firehose_unsupported_update_pauses_accepted_data_until_supported_again(
     )
     .await;
     let keys = wait_keys(&s3, bucket, 1).await;
+    // Delivered under the restored third version, not the original or paused one.
+    assert!(
+        keys[0].contains(&format!("/{bucket}-3-")),
+        "unexpected version in {}",
+        keys[0]
+    );
     assert_eq!(
         object(&s3, bucket, &keys[0], "UNCOMPRESSED").await,
         b"accepted"

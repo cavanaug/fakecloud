@@ -102,6 +102,29 @@ pub enum DeliveryWriteOutcome {
     Cancelled,
 }
 
+fn missing_bucket(account_id: &str, bucket: &str) -> String {
+    format!("bucket {bucket} not found in account {account_id}")
+}
+
+/// Cheap destination existence check under a read guard. Producers can call it
+/// before expensive body encoding; the write path repeats it, and the commit
+/// re-resolves the bucket under the write guard.
+pub fn ensure_delivery_bucket(
+    state: &SharedS3State,
+    account_id: &str,
+    bucket: &str,
+) -> Result<(), String> {
+    let exists = state
+        .read()
+        .get(account_id)
+        .is_some_and(|s| s.buckets.contains_key(bucket));
+    if exists {
+        Ok(())
+    } else {
+        Err(missing_bucket(account_id, bucket))
+    }
+}
+
 /// Stage and hash without configuration or S3 guards, then authorize the commit.
 /// The callback's returned guard pins the producer's configuration through both
 /// durable commit and memory publication. Lock order: producer configuration, S3.
@@ -119,19 +142,10 @@ pub fn put_object_via_store_guarded<G>(
         body: bytes,
         options,
     } = request;
-    let missing = || format!("bucket {bucket} not found in account {account_id}");
+    let missing = || missing_bucket(account_id, bucket);
 
-    // Cheap existence check under a read guard, so a delivery to a missing
-    // bucket never touches the disk.
-    {
-        let accounts = state.read();
-        let exists = accounts
-            .get(account_id)
-            .is_some_and(|s| s.buckets.contains_key(bucket));
-        if !exists {
-            return Err(missing());
-        }
-    }
+    // A delivery to a missing bucket never touches the disk.
+    ensure_delivery_bucket(state, account_id, bucket)?;
 
     // Hash and stage the payload with no S3 lock held: the global S3 lock
     // is shared by every bucket in every account, so a large export or
@@ -537,6 +551,32 @@ mod tests {
             .put_object(ACCOUNT, "ghost", "k", b"x".to_vec(), None)
             .expect_err("missing bucket");
         assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn ensure_delivery_bucket_matches_write_path_error() {
+        let state = shared_state();
+        assert_eq!(
+            ensure_delivery_bucket(&state, ACCOUNT, "logs-bucket"),
+            Ok(())
+        );
+        let expected = format!("bucket ghost not found in account {ACCOUNT}");
+        assert_eq!(
+            ensure_delivery_bucket(&state, ACCOUNT, "ghost"),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            ensure_delivery_bucket(&state, "999999999999", "logs-bucket"),
+            Err("bucket logs-bucket not found in account 999999999999".to_string())
+        );
+        let mut request = guarded_request();
+        request.bucket = "ghost";
+        assert_eq!(
+            put_object_via_store_guarded(&state, None, request, || -> Option<()> {
+                panic!("a missing bucket must fail before authorization")
+            }),
+            Err(expected)
+        );
     }
 
     /// Regression (bug-hunt Tier 0 side-channel-persistence): a delivered object

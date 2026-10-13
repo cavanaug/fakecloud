@@ -28,6 +28,15 @@ pub struct DrainReport {
 #[error("Firehose worker has already started or admission is closed")]
 pub struct WorkerAlreadyStarted;
 
+/// Runtime retry delay after `failures` consecutive failed attempts of one head:
+/// 1 s doubling to a 30 s cap. Retries still start only on worker ticks. The cap
+/// keeps a recovered destination (such as a bucket created late) responsive
+/// while bounding re-encoding work and warnings for a persistently failing stream.
+fn retry_delay(failures: u32) -> Duration {
+    const CAP: Duration = Duration::from_secs(30);
+    Duration::from_secs(1u64 << failures.saturating_sub(1).min(5)).min(CAP)
+}
+
 #[derive(Clone)]
 struct TimePoint {
     monotonic: Instant,
@@ -80,6 +89,8 @@ struct StreamBuffer {
     queue: VecDeque<Arc<DetachedBatch>>,
     in_flight: bool,
     retry_not_before: Option<Instant>,
+    // Consecutive failed attempts of the current head; drives the retry backoff.
+    failures: u32,
     // Runtime-only diagnostic latch. Compare destination values, not versions:
     // an unchanged unsupported update must not flood the one-second scan.
     blocked_config: Option<serde_json::Value>,
@@ -558,9 +569,10 @@ impl EngineCore {
 
     fn complete(&self, completion: Completion) -> bool {
         let mut registry = self.registry.lock();
+        let closed = registry.closed;
         // Consuming the joined job owns this count exactly once. Pruning its
         // generation after commit does not undo the delivered object.
-        if registry.closed && matches!(&completion.result, Ok(DeliveryWriteOutcome::Committed)) {
+        if closed && matches!(&completion.result, Ok(DeliveryWriteOutcome::Committed)) {
             registry.drain_delivered += 1;
         }
         let now = self.clock.now();
@@ -580,12 +592,24 @@ impl EngineCore {
             Ok(_) => {
                 buffer.queue.pop_front();
                 buffer.retry_not_before = None;
+                buffer.failures = 0;
                 true
             }
             Err(error) => {
-                buffer.retry_not_before = Some(now.monotonic + Duration::from_secs(1));
-                tracing::warn!(stream = %key.name, account = %key.account_id, region = %key.region,
-                    object_key = %completion.batch.batch.object_key, %error, "Firehose batch retained for retry");
+                buffer.failures = buffer.failures.saturating_add(1);
+                let object_key = &completion.batch.batch.object_key;
+                if closed {
+                    // The final drain blocks this stream instead of retrying it.
+                    tracing::warn!(stream = %key.name, account = %key.account_id, region = %key.region,
+                        %object_key, attempt = buffer.failures, %error,
+                        "Firehose final delivery attempt failed; batch retained undelivered");
+                } else {
+                    let delay = retry_delay(buffer.failures);
+                    buffer.retry_not_before = Some(now.monotonic + delay);
+                    tracing::warn!(stream = %key.name, account = %key.account_id, region = %key.region,
+                        %object_key, attempt = buffer.failures, retry_in_secs = delay.as_secs(), %error,
+                        "Firehose batch retained for retry");
+                }
                 false
             }
         }
@@ -899,6 +923,31 @@ mod tests {
         Panic,
     }
 
+    /// Every cross-thread wait is bounded: a scheduling regression must fail
+    /// the test rather than hang it.
+    const TEST_WAIT: Duration = Duration::from_secs(10);
+
+    async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(TEST_WAIT, future)
+            .await
+            .expect("engine operation did not finish within the test bound")
+    }
+
+    async fn next_attempt(entered: &mut tokio::sync::mpsc::UnboundedReceiver<Attempt>) -> Attempt {
+        bounded(entered.recv())
+            .await
+            .expect("writer attempt channel closed")
+    }
+
+    async fn wait_closed(engine: &FirehoseEngine) {
+        bounded(async {
+            while !engine.core.registry.lock().closed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
     struct Attempt {
         batch: DeliveryBatch,
         reply: std::sync::mpsc::Sender<Action>,
@@ -917,7 +966,7 @@ mod tests {
                     reply,
                 })
                 .unwrap();
-            match receive.recv().unwrap() {
+            match receive.recv_timeout(TEST_WAIT).unwrap() {
                 Action::Commit => Ok(DeliveryWriteOutcome::Committed),
                 Action::Fail => Err("controlled failure".into()),
                 Action::Panic => panic!("controlled blocking-writer panic"),
@@ -956,7 +1005,9 @@ mod tests {
         }
 
         async fn finish(&self, jobs: &mut Writes) {
-            self.engine.core.complete(jobs.next().await.unwrap());
+            self.engine
+                .core
+                .complete(bounded(jobs.next()).await.unwrap());
         }
     }
 
@@ -967,7 +1018,7 @@ mod tests {
         f.enqueue(vec![Bytes::from_static(b"head")]);
         let mut jobs = Writes::default();
         f.schedule(&mut jobs, false);
-        let first = entered.recv().await.unwrap();
+        let first = next_attempt(&mut entered).await;
         first.reply.send(Action::Fail).unwrap();
         f.finish(&mut jobs).await;
         f.update(NAME, |s| {
@@ -982,7 +1033,7 @@ mod tests {
         f.schedule(&mut jobs, false);
         assert!(jobs.is_empty());
         f.schedule(&mut jobs, true);
-        let retry = entered.recv().await.unwrap();
+        let retry = next_attempt(&mut entered).await;
         assert_eq!(retry.batch.object_key, first.batch.object_key);
         assert_eq!(retry.batch.version_id, "1");
         assert_eq!(retry.batch.destination.output.prefix, "");
@@ -990,7 +1041,7 @@ mod tests {
         retry.reply.send(Action::Commit).unwrap();
         f.finish(&mut jobs).await;
         f.schedule(&mut jobs, false);
-        let next = entered.recv().await.unwrap();
+        let next = next_attempt(&mut entered).await;
         assert_eq!(next.batch.records, vec![Bytes::from_static(b"successor")]);
         assert_eq!(next.batch.version_id, "2");
         assert!(next
@@ -1008,14 +1059,14 @@ mod tests {
         let mut jobs = Writes::default();
         f.enqueue(vec![Bytes::from_static(b"first")]);
         f.schedule(&mut jobs, false);
-        let first = entered.recv().await.unwrap();
+        let first = next_attempt(&mut entered).await;
         f.enqueue(vec![Bytes::from_static(b"second")]);
         f.schedule(&mut jobs, false);
         assert_eq!(jobs.len(), 1);
         first.reply.send(Action::Commit).unwrap();
         f.finish(&mut jobs).await;
         f.schedule(&mut jobs, false);
-        let second = entered.recv().await.unwrap();
+        let second = next_attempt(&mut entered).await;
         assert_eq!(first.batch.records, vec![Bytes::from_static(b"first")]);
         assert_eq!(second.batch.records, vec![Bytes::from_static(b"second")]);
         assert_ne!(first.batch.object_key, second.batch.object_key);
@@ -1047,7 +1098,7 @@ mod tests {
             assert_eq!(jobs.len(), 4);
             let mut initial = BTreeMap::new();
             for _ in 0..4 {
-                let attempt = entered.recv().await.unwrap();
+                let attempt = next_attempt(&mut entered).await;
                 assert_eq!(attempt.batch.records, vec![record(0, 1)]);
                 assert!(initial
                     .insert(attempt.batch.stream.name.clone(), attempt)
@@ -1085,7 +1136,7 @@ mod tests {
                 f.finish(&mut jobs).await;
                 f.schedule(&mut jobs, false);
                 assert_eq!(jobs.len(), 4);
-                let next = entered.recv().await.unwrap();
+                let next = next_attempt(&mut entered).await;
                 assert!(pending.iter().all(|p| p.batch.stream != next.batch.stream));
                 let sequence = expected.get_mut(&next.batch.stream.name).unwrap();
                 assert_eq!(next.batch.records, vec![record(*sequence, 1)]);
@@ -1194,7 +1245,7 @@ mod tests {
         assert_eq!(jobs.len(), 4);
         let mut attempts = BTreeMap::new();
         for _ in 0..4 {
-            let attempt = entered.recv().await.unwrap();
+            let attempt = next_attempt(&mut entered).await;
             assert!(attempts
                 .insert(attempt.batch.stream.name.clone(), attempt)
                 .is_none());
@@ -1214,7 +1265,7 @@ mod tests {
         f.finish(&mut jobs).await;
         f.schedule(&mut jobs, false);
         assert_eq!(jobs.len(), 4);
-        let fifth = entered.recv().await.unwrap();
+        let fifth = next_attempt(&mut entered).await;
         assert_eq!(fifth.batch.stream.name, "e");
         fifth.reply.send(Action::Commit).unwrap();
         for attempt in attempts.into_values() {
@@ -1228,6 +1279,88 @@ mod tests {
         *f.engine.core.writer.write() = Some(Arc::new(FailingWriter));
         let report = f.engine.shutdown().await;
         assert_eq!(report.undelivered_records, 2);
+    }
+
+    #[tokio::test]
+    async fn consecutive_failures_back_off_to_cap_and_success_resets() {
+        let f = Fixture::new(0);
+        let fail = |job: WriteJob| {
+            assert!(!f.engine.core.complete(Completion {
+                batch: job.batch,
+                result: Err("unavailable".into()),
+            }));
+        };
+        // Whole seconds of tick-driven scanning until the retained head is eligible.
+        let eligible_after = || {
+            for waited in 1..=60 {
+                f.advance(1);
+                let mut ready = f.engine.core.prepare(4, true, false, &BTreeSet::new());
+                if let Some(job) = ready.pop() {
+                    assert!(ready.is_empty());
+                    return (waited, job);
+                }
+            }
+            panic!("retained head never became eligible");
+        };
+        f.enqueue(vec![Bytes::from_static(b"head")]);
+        let first = f
+            .engine
+            .core
+            .prepare(4, false, false, &BTreeSet::new())
+            .pop()
+            .unwrap();
+        let capture = CapturedEvents::default();
+        let mut delays = Vec::new();
+        let job = tracing::subscriber::with_default(capture.clone(), || {
+            let mut job = first;
+            for _ in 0..7 {
+                fail(job);
+                let (waited, next) = eligible_after();
+                assert_eq!(next.batch.batch.records, vec![Bytes::from_static(b"head")]);
+                delays.push(waited);
+                job = next;
+            }
+            job
+        });
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
+        let warnings = capture.0.lock().clone();
+        assert_eq!(
+            warnings
+                .iter()
+                .map(|w| (w["attempt"].as_str(), w["retry_in_secs"].as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("1", "1"),
+                ("2", "2"),
+                ("3", "4"),
+                ("4", "8"),
+                ("5", "16"),
+                ("6", "30"),
+                ("7", "30")
+            ]
+        );
+        assert!(warnings.iter().all(|w| w["level"] == "WARN"));
+        // A delivered head resets the schedule for its successor.
+        assert!(f.engine.core.complete(Completion {
+            batch: job.batch,
+            result: Ok(DeliveryWriteOutcome::Committed),
+        }));
+        f.enqueue(vec![Bytes::from_static(b"next")]);
+        let next = f
+            .engine
+            .core
+            .prepare(4, false, false, &BTreeSet::new())
+            .pop()
+            .unwrap();
+        assert_eq!(next.batch.batch.records, vec![Bytes::from_static(b"next")]);
+        fail(next);
+        let (waited, retry) = eligible_after();
+        assert_eq!(waited, 1);
+        assert!(f.engine.core.complete(Completion {
+            batch: retry.batch,
+            result: Ok(DeliveryWriteOutcome::Committed),
+        }));
+        assert_eq!(f.engine.shutdown().await, DrainReport::default());
     }
 
     #[tokio::test]
@@ -1286,7 +1419,7 @@ mod tests {
         f.enqueue(vec![Bytes::from_static(b"panic")]);
         let mut jobs = Writes::default();
         f.schedule(&mut jobs, false);
-        let first = entered.recv().await.unwrap();
+        let first = next_attempt(&mut entered).await;
         first.reply.send(Action::Panic).unwrap();
         f.finish(&mut jobs).await;
         *f.engine.core.writer.write() = Some(Arc::new(FailingWriter));
@@ -1376,7 +1509,7 @@ mod tests {
         let engine = f.engine.clone();
         let drain = tokio::spawn(async move { engine.shutdown().await });
         for _ in 0..2 {
-            let attempt = entered.recv().await.unwrap();
+            let attempt = next_attempt(&mut entered).await;
             attempt
                 .reply
                 .send(if attempt.batch.stream.name == NAME {
@@ -1386,7 +1519,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let report = drain.await.unwrap();
+        let report = bounded(drain).await.unwrap();
         assert_eq!(
             report,
             DrainReport {
@@ -1405,26 +1538,65 @@ mod tests {
         let mut entered = f.controlled();
         f.enqueue(vec![Bytes::from_static(b"head")]);
         f.engine.start().unwrap();
-        let ordinary = entered.recv().await.unwrap();
+        let ordinary = next_attempt(&mut entered).await;
         let engine = f.engine.clone();
         let drain = tokio::spawn(async move { engine.shutdown().await });
         // Poll the drain future once to close admission deterministically.
-        while !f.engine.core.registry.lock().closed {
-            tokio::task::yield_now().await;
-        }
+        wait_closed(&f.engine).await;
         assert!(!drain.is_finished());
         ordinary.reply.send(Action::Fail).unwrap();
-        let final_attempt = entered.recv().await.unwrap();
+        let final_attempt = next_attempt(&mut entered).await;
         assert_eq!(final_attempt.batch.object_key, ordinary.batch.object_key);
         final_attempt.reply.send(Action::Fail).unwrap();
         assert_eq!(
-            drain.await.unwrap(),
+            bounded(drain).await.unwrap(),
             DrainReport {
                 delivered_batches: 0,
                 undelivered_records: 1,
                 undelivered_bytes: 4
             }
         );
+        assert!(entered.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_failure_retains_every_stream_without_duplicate_attempts() {
+        let f = Fixture::new(0);
+        let mut entered = f.controlled();
+        f.enqueue(vec![Bytes::from_static(b"head")]);
+        f.add_stream(ACCOUNT, REGION, "other", 900);
+        f.engine
+            .enqueue(
+                ACCOUNT,
+                REGION,
+                "other",
+                vec![Bytes::from_static(b"active")],
+            )
+            .unwrap();
+        f.engine.start().unwrap();
+        let orphan = next_attempt(&mut entered).await;
+        // An unexpected worker exit leaves its blocking job running unobserved.
+        f.engine.worker.lock().handle.as_ref().unwrap().abort();
+        let capture = CapturedEvents::default();
+        let report = {
+            let _events = tracing::subscriber::set_default(capture.clone());
+            bounded(f.engine.shutdown()).await
+        };
+        // Neither the orphaned head nor the healthy stream is drained: the engine
+        // cannot prove the old job stopped, so it reports instead of duplicating.
+        assert_eq!(
+            report,
+            DrainReport {
+                delivered_batches: 0,
+                undelivered_records: 2,
+                undelivered_bytes: 10
+            }
+        );
+        assert!(entered.try_recv().is_err(), "no final attempt may run");
+        assert!(capture.0.lock().iter().any(|event| event["level"] == "WARN"
+            && event["message"].contains("worker stopped unexpectedly")));
+        orphan.reply.send(Action::Commit).unwrap();
+        assert_eq!(bounded(f.engine.shutdown()).await, report);
         assert!(entered.try_recv().is_err());
     }
 
@@ -1436,14 +1608,12 @@ mod tests {
         assert!(entered.try_recv().is_err());
         f.engine.start().unwrap();
         assert!(f.engine.start().is_err());
-        let ready = entered.recv().await.unwrap();
+        let ready = next_attempt(&mut entered).await;
         let engine = f.engine.clone();
         let drain = tokio::spawn(async move { engine.shutdown().await });
-        while !f.engine.core.registry.lock().closed {
-            tokio::task::yield_now().await;
-        }
+        wait_closed(&f.engine).await;
         ready.reply.send(Action::Commit).unwrap();
-        assert_eq!(drain.await.unwrap().delivered_batches, 1);
+        assert_eq!(bounded(drain).await.unwrap().delivered_batches, 1);
         assert!(f.engine.start().is_err());
     }
 
@@ -1459,8 +1629,10 @@ mod tests {
         assert!(core.upgrade().is_none());
     }
 
+    // Interleaving is not forced: any split between accepted and rejected calls
+    // is valid, but every accepted record must be delivered or reported.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn enqueue_racing_shutdown() {
+    async fn enqueue_concurrent_with_shutdown_accounts_every_accepted_record() {
         let f = Fixture::new(900);
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let engine = f.engine.clone();
@@ -2054,15 +2226,13 @@ mod tests {
         assert!(entered.try_recv().is_err());
         f.advance(1);
         tokio::time::advance(Duration::from_secs(1)).await;
-        let due = entered.recv().await.unwrap();
+        let due = next_attempt(&mut entered).await;
         assert_eq!(due.batch.records, vec![Bytes::from_static(b"idle")]);
         let engine = f.engine.clone();
         let drain = tokio::spawn(async move { engine.shutdown().await });
-        while !f.engine.core.registry.lock().closed {
-            tokio::task::yield_now().await;
-        }
+        wait_closed(&f.engine).await;
         due.reply.send(Action::Commit).unwrap();
-        assert_eq!(drain.await.unwrap().delivered_batches, 1);
+        assert_eq!(bounded(drain).await.unwrap().delivered_batches, 1);
     }
 
     #[tokio::test]
@@ -2085,7 +2255,7 @@ mod tests {
             .clone();
         let mut jobs = Writes::default();
         f.schedule(&mut jobs, false);
-        let first = entered.recv().await.unwrap();
+        let first = next_attempt(&mut entered).await;
         first.reply.send(Action::Panic).unwrap();
         f.finish(&mut jobs).await;
         f.advance(1);
@@ -2094,7 +2264,7 @@ mod tests {
             jobs.batches.values().next().unwrap(),
             &retained
         ));
-        let retry = entered.recv().await.unwrap();
+        let retry = next_attempt(&mut entered).await;
         assert_eq!(retry.batch.object_key, first.batch.object_key);
         assert_eq!(retry.batch.records, vec![Bytes::from_static(b"retain")]);
         retry.reply.send(Action::Commit).unwrap();
@@ -2115,7 +2285,7 @@ mod tests {
             let mut ordinary = None;
             if started {
                 f.engine.start().unwrap();
-                ordinary = Some(entered.recv().await.unwrap());
+                ordinary = Some(next_attempt(&mut entered).await);
             }
             let mut first_drain = Box::pin(f.engine.shutdown());
             poll_fn(|cx| {
@@ -2126,7 +2296,7 @@ mod tests {
             let head = if let Some(head) = ordinary {
                 head
             } else {
-                entered.recv().await.unwrap()
+                next_attempt(&mut entered).await
             };
             drop(first_drain);
             let mut resumed = Box::pin(f.engine.shutdown());
@@ -2139,14 +2309,17 @@ mod tests {
             })
             .await;
             head.reply.send(Action::Commit).unwrap();
-            let (report, ()) = tokio::join!(resumed, async {
-                let successor = entered.recv().await.unwrap();
-                assert_eq!(
-                    successor.batch.records,
-                    vec![Bytes::from_static(b"successor")]
-                );
-                successor.reply.send(Action::Commit).unwrap();
-            });
+            let (report, ()) = bounded(async {
+                tokio::join!(resumed, async {
+                    let successor = next_attempt(&mut entered).await;
+                    assert_eq!(
+                        successor.batch.records,
+                        vec![Bytes::from_static(b"successor")]
+                    );
+                    successor.reply.send(Action::Commit).unwrap();
+                })
+            })
+            .await;
             assert_eq!(
                 report,
                 DrainReport {
@@ -2166,7 +2339,7 @@ mod tests {
         f.enqueue(vec![Bytes::from_static(b"detached")]);
         let mut jobs = Writes::default();
         f.schedule(&mut jobs, false);
-        let head = entered.recv().await.unwrap();
+        let head = next_attempt(&mut entered).await;
         f.update(NAME, |s| {
             s.destination.as_mut().unwrap().buffering_interval_seconds = Some(60)
         });
@@ -2224,7 +2397,7 @@ mod tests {
             let gate = self.gate.lock().take();
             if let Some((entered, resume)) = gate {
                 entered.send(()).unwrap();
-                resume.recv().unwrap();
+                resume.recv_timeout(TEST_WAIT).unwrap();
             }
             self.clock.now()
         }
@@ -2262,7 +2435,7 @@ mod tests {
                     engine.core.prepare(4, true, false, &BTreeSet::new())
                 }
             });
-            receive_entered.recv().await.unwrap();
+            bounded(receive_entered.recv()).await.unwrap();
             assert!(
                 f.engine.core.state.try_write().is_none(),
                 "configuration must be pinned when the detachment time is sampled"
@@ -2630,7 +2803,7 @@ mod tests {
             disk,
             boundary: Box::new(move || {
                 entered.send(()).unwrap();
-                receive_resume.lock().recv().unwrap();
+                receive_resume.lock().recv_timeout(TEST_WAIT).unwrap();
             }),
         });
         f.engine.set_s3(s3.clone());
@@ -2639,7 +2812,7 @@ mod tests {
         let registry = f.engine.core.clone();
         let check_s3 = s3.clone();
         let mutation = std::thread::spawn(move || {
-            receive_entered.recv().unwrap();
+            receive_entered.recv_timeout(TEST_WAIT).unwrap();
             assert!(
                 check_s3.try_write().is_some(),
                 "staging must not hold S3 lock"
@@ -2653,6 +2826,7 @@ mod tests {
             // conditions, with no elapsed-time assumptions or sleeps.
             let mut config = state.write();
             resume.send(()).unwrap();
+            let deadline = std::time::Instant::now() + TEST_WAIT;
             loop {
                 let staged = std::fs::read_dir(&spool).ok().is_some_and(|entries| {
                     entries.filter_map(Result::ok).any(|entry| {
@@ -2663,6 +2837,10 @@ mod tests {
                 if staged {
                     break;
                 }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "real staging did not complete"
+                );
                 std::thread::yield_now();
             }
             edit(&mut config);
