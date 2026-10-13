@@ -3,6 +3,9 @@ pub mod introspection;
 mod output;
 pub(crate) mod service;
 pub(crate) mod state;
+#[cfg(test)]
+#[path = "../tests/fixtures/xerial_decoder.rs"]
+mod test_xerial_decoder;
 
 pub use delivery::FirehoseDeliveryImpl;
 pub use service::FirehoseService;

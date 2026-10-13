@@ -9,6 +9,7 @@ use uuid::Uuid;
 pub(crate) enum Compression {
     Uncompressed,
     Gzip,
+    Snappy,
 }
 
 impl Compression {
@@ -16,6 +17,7 @@ impl Compression {
         match self {
             Self::Uncompressed => None,
             Self::Gzip => Some("gzip"),
+            Self::Snappy => Some("snappy-java"),
         }
     }
 
@@ -23,6 +25,7 @@ impl Compression {
         match self {
             Self::Uncompressed => "",
             Self::Gzip => ".gz",
+            Self::Snappy => ".snappy",
         }
     }
 }
@@ -84,6 +87,42 @@ pub(crate) fn encode_records(
             }
             Ok(Bytes::from(encoder.finish()?))
         }
+        Compression::Snappy => {
+            // Xerial's header and big-endian lengths wrap raw Snappy blocks;
+            // Snappy's separate framed-stream format is not compatible here.
+            const BLOCK_SIZE: usize = 32768;
+            let mut payload = b"\x82SNAPPY\0\0\0\0\x01\0\0\0\x01".to_vec();
+            let mut encoder = snap::raw::Encoder::new();
+            let mut encode_block = |input: &[u8]| -> std::io::Result<()> {
+                let compressed = encoder.compress_vec(input).map_err(std::io::Error::other)?;
+                let length = u32::try_from(compressed.len()).map_err(std::io::Error::other)?;
+                payload.extend_from_slice(&length.to_be_bytes());
+                payload.extend_from_slice(&compressed);
+                Ok(())
+            };
+            let mut block = Vec::with_capacity(BLOCK_SIZE);
+            // The delimiter is payload like any record byte, so it shares the
+            // fixed-size block chunking rather than starting a new block.
+            for part in records
+                .iter()
+                .flat_map(|record| [record.as_slice(), delimiter])
+            {
+                let mut remaining = part;
+                while !remaining.is_empty() {
+                    let length = (BLOCK_SIZE - block.len()).min(remaining.len());
+                    block.extend_from_slice(&remaining[..length]);
+                    remaining = &remaining[length..];
+                    if block.len() == BLOCK_SIZE {
+                        encode_block(&block)?;
+                        block.clear();
+                    }
+                }
+            }
+            if !block.is_empty() {
+                encode_block(&block)?;
+            }
+            Ok(Bytes::from(payload))
+        }
     }
 }
 
@@ -120,6 +159,118 @@ mod tests {
         DateTime::parse_from_rfc3339(value)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn snappy_block_windows_span_records_without_changing_bytes() {
+        use crate::test_xerial_decoder::{
+            binary_input, decode, incompressible_input, multiblock_input,
+        };
+
+        for input in [
+            binary_input(),
+            multiblock_input(),
+            vec![b'x'; 70000],
+            incompressible_input(70000),
+        ] {
+            let encoded = encode_records(
+                &[input[..17].to_vec(), input[17..].to_vec()],
+                &config(Compression::Snappy, false),
+            )
+            .unwrap();
+            let blocks = decode(&encoded).unwrap();
+            assert_eq!(
+                blocks.iter().map(Vec::len).collect::<Vec<_>>(),
+                input.chunks(32768).map(<[u8]>::len).collect::<Vec<_>>()
+            );
+            assert_eq!(blocks.concat(), input);
+        }
+    }
+
+    #[test]
+    fn snappy_block_boundaries_and_empty_stream_match_xerial() {
+        use crate::test_xerial_decoder::{decode, incompressible_input};
+
+        for (size, expected) in [
+            (32767, vec![32767]),
+            (32768, vec![32768]),
+            (32769, vec![32768, 1]),
+            (65536, vec![32768, 32768]),
+            (65537, vec![32768, 32768, 1]),
+        ] {
+            let input = incompressible_input(size);
+            let encoded = encode_records(
+                std::slice::from_ref(&input),
+                &config(Compression::Snappy, false),
+            )
+            .unwrap();
+            let blocks = decode(&encoded).unwrap();
+            assert_eq!(blocks.iter().map(Vec::len).collect::<Vec<_>>(), expected);
+            assert_eq!(blocks.concat(), input);
+        }
+        assert_eq!(
+            encode_records(&[vec![], vec![]], &config(Compression::Snappy, false))
+                .unwrap()
+                .as_ref(),
+            b"\x82SNAPPY\0\0\0\0\x01\0\0\0\x01"
+        );
+    }
+
+    #[test]
+    fn snappy_extensions_replace_the_default() {
+        let now = time("2026-10-12T09:00:00Z");
+        let uuid = Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap();
+        for (extension, suffix) in [
+            (None, ".snappy"),
+            (Some(""), ".snappy"),
+            (Some(".custom.log"), ".custom.log"),
+        ] {
+            let config = OutputConfig {
+                prefix: "",
+                file_extension: extension,
+                compression: Compression::Snappy,
+                append_delimiter: false,
+            };
+            assert_eq!(object_key("events", "1", &config, now, now, uuid), format!(
+                "2026/10/12/09/events-1-2026-10-12-09-00-00-12345678-1234-4234-8234-123456789abc{suffix}"));
+        }
+    }
+
+    #[test]
+    fn xerial_decoder_accepts_independent_java_fixtures() {
+        use crate::test_xerial_decoder::{binary_input, decode, multiblock_input};
+
+        let binary = decode(include_bytes!("../tests/fixtures/xerial_binary.snappy")).unwrap();
+        assert_eq!(binary.iter().map(Vec::len).collect::<Vec<_>>(), [1024]);
+        assert_eq!(binary.concat(), binary_input());
+        let multiblock =
+            decode(include_bytes!("../tests/fixtures/xerial_multiblock.snappy")).unwrap();
+        assert_eq!(
+            multiblock.iter().map(Vec::len).collect::<Vec<_>>(),
+            [32768, 32768, 4464]
+        );
+        assert_eq!(multiblock.concat(), multiblock_input());
+    }
+
+    #[test]
+    fn xerial_decoder_rejects_truncation_bad_lengths_and_large_blocks() {
+        use crate::test_xerial_decoder::decode;
+
+        let fixture = include_bytes!("../tests/fixtures/xerial_binary.snappy");
+        assert!(decode(&fixture[..fixture.len() - 1]).is_err());
+        let mut bad_header = fixture.to_vec();
+        bad_header[0] = 0;
+        assert!(decode(&bad_header).is_err());
+        for tail in [
+            vec![0, 0],
+            vec![0, 0, 0, 0],
+            vec![255, 255, 255, 255],
+            vec![0, 0, 0, 3, 128, 128, 4],
+        ] {
+            let mut invalid = fixture[..16].to_vec();
+            invalid.extend(tail);
+            assert!(decode(&invalid).is_err());
+        }
     }
 
     fn config(compression: Compression, append_delimiter: bool) -> OutputConfig<'static> {
@@ -204,6 +355,22 @@ mod tests {
         // The delimiter is part of the payload that GZIP compresses.
         let gzip = config(Compression::Gzip, true);
         assert_eq!(gunzip(&encode_records(&records, &gzip).unwrap()), expected);
+        // Snappy chunks delimiters with record bytes, so a delimiter can close
+        // one block and blocks stay exactly 32768 decoded bytes.
+        let snappy = config(Compression::Snappy, true);
+        assert_eq!(
+            crate::test_xerial_decoder::decode(&encode_records(&records, &snappy).unwrap())
+                .unwrap()
+                .concat(),
+            expected
+        );
+        let blocks = crate::test_xerial_decoder::decode(
+            &encode_records(&[vec![b'x'; 32767], vec![b'y'; 5]], &snappy).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(blocks.iter().map(Vec::len).collect::<Vec<_>>(), [32768, 6]);
+        assert_eq!(blocks[0][32767], b'\n');
+        assert_eq!(blocks[1], b"yyyyy\n");
     }
 
     #[test]
