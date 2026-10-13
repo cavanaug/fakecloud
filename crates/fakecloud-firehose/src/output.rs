@@ -271,6 +271,17 @@ mod tests {
             invalid.extend(tail);
             assert!(decode(&invalid).is_err());
         }
+        // A well-formed raw block is rejected only for expanding past the
+        // default 32 KiB block input; one byte less decodes.
+        for (size, accepted) in [(32768, true), (32769, false)] {
+            let block = snap::raw::Encoder::new()
+                .compress_vec(&vec![b'z'; size])
+                .unwrap();
+            let mut stream = fixture[..16].to_vec();
+            stream.extend_from_slice(&u32::try_from(block.len()).unwrap().to_be_bytes());
+            stream.extend_from_slice(&block);
+            assert_eq!(decode(&stream).is_ok(), accepted, "{size}-byte block");
+        }
     }
 
     fn config(compression: Compression, append_delimiter: bool) -> OutputConfig<'static> {

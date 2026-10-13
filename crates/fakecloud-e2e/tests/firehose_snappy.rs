@@ -1,5 +1,8 @@
 use aws_sdk_firehose::primitives::Blob;
-use aws_sdk_firehose::types::{CompressionFormat, ExtendedS3DestinationConfiguration, Record};
+use aws_sdk_firehose::types::{
+    CompressionFormat, ExtendedS3DestinationConfiguration, ProcessingConfiguration, Processor,
+    ProcessorType, Record,
+};
 use fakecloud_testkit::TestServer;
 
 #[path = "../../fakecloud-firehose/tests/fixtures/xerial_decoder.rs"]
@@ -129,6 +132,66 @@ async fn firehose_snappy_binary_multiblock_and_extension_overrides() {
             );
         }
     }
+}
+
+/// `AppendDelimiterToRecord` adds `\n` after every record before compression.
+/// The delimiter is ordinary payload for Snappy's 32 KiB block window, so it
+/// can close a block instead of starting a new one.
+#[tokio::test]
+async fn firehose_snappy_delimiters_share_block_windows() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let firehose = server.firehose_client().await;
+    let bucket = "fh-snappy-delimited";
+    s3.create_bucket().bucket(bucket).send().await.unwrap();
+    firehose
+        .create_delivery_stream()
+        .delivery_stream_name("snappy-delimited")
+        .extended_s3_destination_configuration(
+            ExtendedS3DestinationConfiguration::builder()
+                .role_arn("arn:aws:iam::123456789012:role/firehose")
+                .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                .compression_format(CompressionFormat::Snappy)
+                .processing_configuration(
+                    ProcessingConfiguration::builder()
+                        .enabled(true)
+                        .processors(
+                            Processor::builder()
+                                .r#type(ProcessorType::AppendDelimiterToRecord)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let response = firehose
+        .put_record_batch()
+        .delivery_stream_name("snappy-delimited")
+        .records(
+            Record::builder()
+                .data(Blob::new(vec![b'x'; 32767]))
+                .build()
+                .unwrap(),
+        )
+        .records(Record::builder().data(Blob::new(b"y")).build().unwrap())
+        .records(Record::builder().data(Blob::new([0, 255])).build().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.failed_put_count(), 0);
+    let (_, raw, decoded) = snappy_object(&s3, bucket, ".snappy").await;
+    let mut expected = vec![b'x'; 32767];
+    expected.extend_from_slice(b"\ny\n\x00\xff\n");
+    assert_eq!(decoded, expected);
+    let blocks = xerial::decode(&raw).unwrap();
+    assert_eq!(blocks.iter().map(Vec::len).collect::<Vec<_>>(), [32768, 5]);
+    assert_eq!(blocks[0][32767], b'\n');
+    assert_eq!(blocks[1], b"y\n\x00\xff\n");
 }
 
 #[tokio::test]
