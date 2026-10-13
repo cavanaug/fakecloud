@@ -3,6 +3,7 @@ title = "Parity matrix"
 description = "Service-by-service behavior parity: what is real, what is synthesized, and what is not yet implemented."
 weight = 1
 +++
+
 fakecloud implements **106 AWS services** with **7,551 operations**. **249,449/249,449 generated Smithy conformance variants pass** on every commit — true 100% across every implemented service, no flake margin and no skipped services. Conformance checks request/response shapes, field names, and error codes against [AWS's own Smithy models](https://github.com/faiscadev/fakecloud/blob/main/conformance-baseline.json). Behavior parity varies by service — some run real infrastructure (Postgres, Redis, Docker containers), some run a real control plane but return synthesized data for complex queries, and a few have control-plane-only coverage with no data-plane enforcement.
 
 | Service | Ops | Protocol | Control plane | Data plane | Known limitations |

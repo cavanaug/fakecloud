@@ -131,12 +131,14 @@ mod tests {
         }
     }
 
+    /// Decode exactly one GZIP member: a second member or trailing bytes after
+    /// the first member's trailer fail the assertion.
     fn gunzip(encoded: &[u8]) -> Vec<u8> {
         assert!(encoded.starts_with(&[0x1f, 0x8b, 8]));
+        let mut decoder = flate2::bufread::GzDecoder::new(encoded);
         let mut decoded = Vec::new();
-        flate2::read::GzDecoder::new(encoded)
-            .read_to_end(&mut decoded)
-            .unwrap();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert!(decoder.into_inner().is_empty(), "expected one GZIP member");
         decoded
     }
 

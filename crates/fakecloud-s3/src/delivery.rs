@@ -266,6 +266,7 @@ mod tests {
         let object = &accounts.get(ACCOUNT).unwrap().buckets["logs-bucket"].objects["events.gz"];
         assert!(matches!(object.body, BodyRef::Disk { .. }));
         assert_eq!(object.size, body.len() as u64);
+        assert_eq!(object.etag, format!("{:x}", Md5::digest(&body)));
         assert_eq!(object.content_encoding.as_deref(), Some("gzip"));
         assert_eq!(object.storage_class, "STANDARD");
         assert_eq!(disk.open_object_body(&object.body).unwrap(), body);
@@ -276,6 +277,7 @@ mod tests {
         assert_eq!(object.meta.content_type, "application/octet-stream");
         assert_eq!(object.meta.content_encoding.as_deref(), Some("gzip"));
         assert_eq!(object.meta.storage_class, "STANDARD");
+        assert_eq!(object.meta.etag, format!("{:x}", Md5::digest(&body)));
         assert_eq!(disk.open_object_body(&object.body).unwrap(), body);
     }
 

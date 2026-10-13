@@ -2,20 +2,24 @@ use std::io::Read;
 
 use aws_sdk_firehose::primitives::Blob;
 use aws_sdk_firehose::types::{
-    CompressionFormat, ExtendedS3DestinationConfiguration, Record, S3DestinationConfiguration,
+    CompressionFormat, ExtendedS3DestinationConfiguration, ProcessingConfiguration, Processor,
+    ProcessorType, Record, S3DestinationConfiguration,
 };
 use base64::Engine;
 use fakecloud_testkit::TestServer;
+use md5::{Digest, Md5};
 
+/// Decode exactly one GZIP member: a second member or trailing bytes after the
+/// first member's trailer fail the assertion.
 fn decode_gzip(raw: &[u8]) -> Vec<u8> {
     assert!(
         raw.starts_with(&[0x1f, 0x8b, 8]),
         "S3 must return actual GZIP bytes"
     );
+    let mut decoder = flate2::bufread::GzDecoder::new(raw);
     let mut decoded = Vec::new();
-    flate2::read::GzDecoder::new(raw)
-        .read_to_end(&mut decoded)
-        .unwrap();
+    decoder.read_to_end(&mut decoded).unwrap();
+    assert!(decoder.into_inner().is_empty(), "expected one GZIP member");
     decoded
 }
 
@@ -54,8 +58,44 @@ async fn gzip_object(
     assert_eq!(object.content_type(), Some("application/octet-stream"));
     assert_eq!(object.content_encoding(), Some("gzip"));
     let content_length = object.content_length().unwrap();
+    let etag = object.e_tag().map(str::to_owned);
     let raw = object.body.collect().await.unwrap().into_bytes().to_vec();
     assert_eq!(content_length, raw.len() as i64);
+    // Size and ETag describe the stored compressed bytes, like any
+    // single-part S3 object.
+    let md5_etag = format!("\"{:x}\"", Md5::digest(&raw));
+    assert_eq!(etag.as_deref(), Some(md5_etag.as_str()));
+    assert_eq!(listing.contents()[0].e_tag(), Some(md5_etag.as_str()));
+    assert_eq!(listing.contents()[0].size(), Some(content_length));
+
+    let head = s3
+        .head_object()
+        .bucket(bucket)
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_type(), Some("application/octet-stream"));
+    assert_eq!(head.content_encoding(), Some("gzip"));
+    assert_eq!(head.content_length(), Some(content_length));
+    assert_eq!(head.e_tag(), Some(md5_etag.as_str()));
+
+    // S3 never decodes the object: a ranged read returns the stored GZIP
+    // header bytes, still labelled with the object's content encoding.
+    let ranged = s3
+        .get_object()
+        .bucket(bucket)
+        .key(&key)
+        .range("bytes=0-2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ranged.content_encoding(), Some("gzip"));
+    assert_eq!(
+        ranged.body.collect().await.unwrap().into_bytes().as_ref(),
+        &[0x1f, 0x8b, 8]
+    );
+
     let decoded = decode_gzip(&raw);
     (key, raw, decoded)
 }
@@ -119,6 +159,54 @@ async fn firehose_gzip_batch_preserves_bytes_and_extension_overrides() {
         let (_, _, decoded) = gzip_object(&s3, &bucket, "", expected_extension).await;
         assert_eq!(decoded, b"abcdef\n\x00\xff");
     }
+}
+
+/// `AppendDelimiterToRecord` adds `\n` after every record before the payload
+/// is compressed, so the delimiters live inside the GZIP stream.
+#[tokio::test]
+async fn firehose_gzip_compresses_records_after_append_delimiter() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let firehose = server.firehose_client().await;
+    let bucket = "fh-gzip-delimited";
+    s3.create_bucket().bucket(bucket).send().await.unwrap();
+    firehose
+        .create_delivery_stream()
+        .delivery_stream_name("gzip-delimited")
+        .extended_s3_destination_configuration(
+            ExtendedS3DestinationConfiguration::builder()
+                .role_arn("arn:aws:iam::123456789012:role/firehose")
+                .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                .compression_format(CompressionFormat::Gzip)
+                .processing_configuration(
+                    ProcessingConfiguration::builder()
+                        .enabled(true)
+                        .processors(
+                            Processor::builder()
+                                .r#type(ProcessorType::AppendDelimiterToRecord)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let response = firehose
+        .put_record_batch()
+        .delivery_stream_name("gzip-delimited")
+        .records(Record::builder().data(Blob::new(b"a")).build().unwrap())
+        .records(Record::builder().data(Blob::new(b"b\n")).build().unwrap())
+        .records(Record::builder().data(Blob::new([0, 255])).build().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.failed_put_count(), 0);
+    let (_, _, decoded) = gzip_object(&s3, bucket, "", ".gz").await;
+    assert_eq!(decoded, b"a\nb\n\n\x00\xff\n");
 }
 
 #[tokio::test]

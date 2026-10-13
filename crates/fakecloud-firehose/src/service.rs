@@ -1971,6 +1971,75 @@ mod tests {
             .is_empty());
     }
 
+    /// `AppendDelimiterToRecord` runs before compression: every record of an
+    /// API or internal delivery, including an empty one (which alone would not
+    /// produce a GZIP object), is followed by `\n` inside the GZIP stream.
+    #[test]
+    fn gzip_compresses_records_after_append_delimiter() {
+        use fakecloud_core::delivery::FirehoseDelivery;
+        use std::io::Read;
+
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-gzip-delim");
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "gzip-delim",
+                "ExtendedS3DestinationConfiguration": {
+                    "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                    "BucketARN": "arn:aws:s3:::fh-gzip-delim",
+                    "CompressionFormat": "GZIP",
+                    "ProcessingConfiguration": {
+                        "Enabled": true,
+                        "Processors": [{"Type": "AppendDelimiterToRecord"}]
+                    }
+                }
+            }),
+        ))
+        .unwrap();
+        svc.deliver_records(
+            S3_ACCOUNT,
+            "us-east-1",
+            "gzip-delim",
+            vec![b"a".to_vec(), b"b\n".to_vec(), vec![0, 255]],
+        )
+        .unwrap();
+        svc.deliver_records(S3_ACCOUNT, "us-east-1", "gzip-delim", vec![vec![]])
+            .unwrap();
+        let hook =
+            crate::FirehoseDeliveryImpl::new(svc.shared_state(), svc.s3.as_ref().unwrap().clone());
+        hook.set_s3_store(disk.clone());
+        hook.put_record(
+            "arn:aws:firehose:us-east-1:123456789012:deliverystream/gzip-delim",
+            b"{\"internal\":true}",
+        );
+
+        let s3 = svc.s3.as_ref().unwrap().read();
+        let mut decoded: Vec<Vec<u8>> = s3.get(S3_ACCOUNT).unwrap().buckets["fh-gzip-delim"]
+            .objects
+            .values()
+            .map(|object| {
+                assert!(object.key.ends_with(".gz"), "{}", object.key);
+                assert_eq!(object.content_encoding.as_deref(), Some("gzip"));
+                let raw = disk.open_object_body(&object.body).unwrap();
+                assert_eq!(object.size, raw.len() as u64);
+                let mut plain = Vec::new();
+                flate2::read::GzDecoder::new(raw.as_ref())
+                    .read_to_end(&mut plain)
+                    .unwrap();
+                plain
+            })
+            .collect();
+        decoded.sort();
+        assert_eq!(
+            decoded,
+            vec![
+                b"\n".to_vec(),
+                b"a\nb\n\n\x00\xff\n".to_vec(),
+                b"{\"internal\":true}\n".to_vec(),
+            ]
+        );
+    }
+
     #[test]
     fn delivery_preserves_binary_bytes_and_producer_delimiters() {
         let (svc, disk, _tmp) = firehose_with_disk_s3("fh-bytes");
