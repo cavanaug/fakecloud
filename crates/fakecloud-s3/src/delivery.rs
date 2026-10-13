@@ -55,6 +55,51 @@ pub fn put_object_via_store(
     body: Vec<u8>,
     content_type: Option<&str>,
 ) -> Result<(), String> {
+    put_object_via_store_with_options(
+        state,
+        store,
+        DeliveryObjectRequest {
+            account: account_id,
+            bucket,
+            key,
+            body: Bytes::from(body),
+            options: DeliveryObjectOptions {
+                content_type: content_type.map(str::to_owned),
+                ..Default::default()
+            },
+        },
+    )
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DeliveryObjectOptions {
+    pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+}
+
+pub struct DeliveryObjectRequest<'a> {
+    pub account: &'a str,
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub body: Bytes,
+    pub options: DeliveryObjectOptions,
+}
+
+/// Metadata-aware form of [`put_object_via_store`]. A failed persistent write
+/// returns an error without publishing an in-memory success; the producer owns
+/// any retry or session-only fallback policy.
+pub fn put_object_via_store_with_options(
+    state: &SharedS3State,
+    store: Option<&dyn S3Store>,
+    request: DeliveryObjectRequest<'_>,
+) -> Result<(), String> {
+    let DeliveryObjectRequest {
+        account: account_id,
+        bucket,
+        key,
+        body: bytes,
+        options,
+    } = request;
     let missing = || format!("bucket {bucket} not found in account {account_id}");
 
     // Cheap existence check under a read guard, so a delivery to a missing
@@ -72,7 +117,6 @@ pub fn put_object_via_store(
     // Hash and stage the payload with no S3 lock held: the global S3 lock
     // is shared by every bucket in every account, so a large export or
     // log delivery written to disk under it would stall all of S3.
-    let bytes = Bytes::from(body);
     let size = bytes.len() as u64;
     let etag = format!("{:x}", Md5::digest(&bytes));
     let mut spooled = crate::service::run_blocking_io(|| {
@@ -83,9 +127,11 @@ pub fn put_object_via_store(
     let mut obj = S3Object {
         key: key.to_string(),
         body: memory_body(bytes),
-        content_type: content_type
-            .unwrap_or("application/octet-stream")
-            .to_string(),
+        content_type: options
+            .content_type
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
+        content_encoding: options.content_encoding,
+        storage_class: "STANDARD".to_string(),
         etag,
         size,
         last_modified: Utc::now(),
@@ -182,6 +228,90 @@ mod tests {
     }
 
     #[test]
+    fn options_write_persists_encoding_and_canonical_body() {
+        use fakecloud_persistence::{s3::DiskS3Store, BodyRef, BucketMeta};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = DiskS3Store::new(
+            tmp.path().join("s3"),
+            Arc::new(fakecloud_persistence::cache::BodyCache::new(1024)),
+        );
+        disk.put_bucket_meta(
+            "logs-bucket",
+            &BucketMeta {
+                name: "logs-bucket".to_owned(),
+                region: "us-east-1".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let state = shared_state();
+        let body = Bytes::from_static(b"opaque encoded bytes");
+        put_object_via_store_with_options(
+            &state,
+            Some(&disk),
+            DeliveryObjectRequest {
+                account: ACCOUNT,
+                bucket: "logs-bucket",
+                key: "events.gz",
+                body: body.clone(),
+                options: DeliveryObjectOptions {
+                    content_type: Some("application/octet-stream".to_owned()),
+                    content_encoding: Some("gzip".to_owned()),
+                },
+            },
+        )
+        .unwrap();
+        let accounts = state.read();
+        let object = &accounts.get(ACCOUNT).unwrap().buckets["logs-bucket"].objects["events.gz"];
+        assert!(matches!(object.body, BodyRef::Disk { .. }));
+        assert_eq!(object.size, body.len() as u64);
+        assert_eq!(object.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(object.storage_class, "STANDARD");
+        assert_eq!(disk.open_object_body(&object.body).unwrap(), body);
+        drop(accounts);
+
+        let loaded = disk.load().unwrap();
+        let object = &loaded.buckets["logs-bucket"].objects["events.gz"];
+        assert_eq!(object.meta.content_type, "application/octet-stream");
+        assert_eq!(object.meta.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(object.meta.storage_class, "STANDARD");
+        assert_eq!(disk.open_object_body(&object.body).unwrap(), body);
+    }
+
+    #[test]
+    fn options_write_failure_does_not_publish_memory_success() {
+        use fakecloud_persistence::s3::DiskS3Store;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocked = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked, b"blocks staging").unwrap();
+        let disk = DiskS3Store::new(
+            blocked,
+            Arc::new(fakecloud_persistence::cache::BodyCache::new(1024)),
+        );
+        let state = shared_state();
+        let result = put_object_via_store_with_options(
+            &state,
+            Some(&disk),
+            DeliveryObjectRequest {
+                account: ACCOUNT,
+                bucket: "logs-bucket",
+                key: "events.gz",
+                body: Bytes::from_static(b"encoded bytes"),
+                options: DeliveryObjectOptions {
+                    content_type: None,
+                    content_encoding: Some("gzip".to_owned()),
+                },
+            },
+        );
+        assert!(result.is_err());
+        assert!(state.read().get(ACCOUNT).unwrap().buckets["logs-bucket"]
+            .objects
+            .is_empty());
+    }
+
+    #[test]
     fn put_object_writes_to_bucket() {
         let state = shared_state();
         let delivery = S3DeliveryImpl::new(state.clone());
@@ -200,6 +330,8 @@ mod tests {
         let obj = bucket.objects.get("exports/run-1.txt").unwrap();
         assert_eq!(obj.size, 11);
         assert_eq!(obj.content_type, "text/plain");
+        assert_eq!(obj.content_encoding, None);
+        assert_eq!(obj.storage_class, "STANDARD");
         assert!(!obj.etag.is_empty());
     }
 

@@ -1,12 +1,12 @@
 +++
 title = "Firehose"
-description = "Amazon Data Firehose delivery streams and immediate uncompressed S3 delivery, JSON 1.1 protocol."
+description = "Amazon Data Firehose delivery streams and immediate S3 delivery with uncompressed or GZIP output, JSON 1.1 protocol."
 weight = 32
 +++
 
-fakecloud implements Amazon Data Firehose's JSON 1.1 control plane and real uncompressed delivery to [S3](/docs/services/s3/). `PutRecord` writes one object; `PutRecordBatch` concatenates the valid records in that request into one object. Separate calls do not share a buffer.
+fakecloud implements Amazon Data Firehose's JSON 1.1 control plane and real delivery to [S3](/docs/services/s3/) with uncompressed or GZIP output. `PutRecord` writes one object; `PutRecordBatch` concatenates the valid records in that request into one object. Separate calls do not share a buffer.
 
-**Status: control-plane parity and immediate uncompressed S3 delivery. Size/time buffering and compression are not implemented.**
+**Status: control-plane parity and immediate S3 delivery with uncompressed or GZIP output. Size/time buffering is not implemented.**
 
 ## Supported today
 
@@ -17,15 +17,15 @@ fakecloud implements Amazon Data Firehose's JSON 1.1 control plane and real unco
   - `IntervalInSeconds`: `0` or 60 - 900 s.
 
   Out-of-range values return `InvalidArgumentException`. These hints are configuration-only: delivery is immediate regardless of their values.
-- **Records** — `PutRecord` / `PutRecordBatch` assign per-record `RecordId`s and deliver valid decoded data to a configured S3 destination. Binary bytes and producer-supplied delimiters are preserved exactly; no separators are added unless the `AppendDelimiterToRecord` processor is enabled. Without it, an all-empty delivery produces no object.
-- **New line delimiter** — when `ProcessingConfiguration` has `Enabled: true` and its `Processors` include `AppendDelimiterToRecord`, a newline (`\n`) is written after every record, including the last one and empty records. This applies to API deliveries and to internal CloudWatch Logs and SES deliveries. The optional `Delimiter` parameter is stored but not interpreted: AWS documents only a new line delimiter. Other processors in the same configuration are not run. CloudFormation-created streams do not yet store `ProcessingConfiguration`, so this applies to streams configured through the Firehose API.
-- **S3 output** — static prefixes, UTC date hierarchy, stream/version/time/UUID object names, and `FileExtension` overrides. Objects have `Content-Type: application/octet-stream`, no content encoding, and the body's MD5 as their `ETag`. Delivered objects survive a restart in persistent storage mode.
+- **Records** — `PutRecord` / `PutRecordBatch` assign per-record `RecordId`s and deliver valid decoded data to a configured S3 destination. Binary bytes and producer-supplied delimiters are preserved exactly before compression; no separators are added unless the `AppendDelimiterToRecord` processor is enabled. Without it, an all-empty delivery produces no object.
+- **New line delimiter** — when `ProcessingConfiguration` has `Enabled: true` and its `Processors` include `AppendDelimiterToRecord`, a newline (`\n`) is written after every record, including the last one and empty records, before any compression. This applies to API deliveries and to internal CloudWatch Logs and SES deliveries. The optional `Delimiter` parameter is stored but not interpreted: AWS documents only a new line delimiter. Other processors in the same configuration are not run. CloudFormation-created streams do not yet store `ProcessingConfiguration`, so this applies to streams configured through the Firehose API.
+- **S3 output** — static prefixes, UTC date hierarchy, stream/version/time/UUID object names, and `FileExtension` overrides. Objects have `Content-Type: application/octet-stream` and the stored body's MD5 as their `ETag`. GZIP output has `Content-Encoding: gzip`; uncompressed output has no content encoding. Delivered bytes and metadata survive a restart in persistent storage mode, including records routed through the internal Logs/SES adapter.
 - **Tags** — `ListTagsForDeliveryStream` / `TagDeliveryStream` / `UntagDeliveryStream`. Keyed by stream ARN.
 - **Server-side encryption** — `StartDeliveryStreamEncryption` / `StopDeliveryStreamEncryption`. Start sets the stream's `DeliveryStreamEncryptionConfiguration` to `Status=ENABLED` with the requested `KeyType` (defaults `AWS_OWNED_CMK`; stores the `KeyARN` for `CUSTOMER_MANAGED_CMK`); Stop flips it to `DISABLED`. The config is surfaced on `DescribeDeliveryStream`. Unknown streams return `ResourceNotFoundException`.
 
 ## S3 object bytes and names
 
-Create the destination bucket before sending records. Within one `PutRecordBatch`, records `abc`, `def\n`, and the binary bytes `00 ff` become exactly `abcdef\n` followed by `00 ff`. Producers must supply their own delimiters, such as a newline for each JSON record, or enable `AppendDelimiterToRecord`, which writes the same records as exactly `abc\ndef\n\n` followed by `00 ff 0a`.
+Create the destination bucket before sending records. Within one `PutRecordBatch`, records `abc`, `def\n`, and the binary bytes `00 ff` become exactly `abcdef\n` followed by `00 ff`. For GZIP output, those concatenated bytes are encoded in one GZIP stream. Producers must supply their own delimiters, such as a newline for each JSON record, or enable `AppendDelimiterToRecord`, which writes the same records as exactly `abc\ndef\n\n` followed by `00 ff 0a` before any compression.
 
 For a static prefix, the key format is:
 
@@ -35,7 +35,14 @@ For a static prefix, the key format is:
 
 The prefix and suffix times are UTC. With immediate delivery they use the same delivery time. The version comes from the delivery stream configuration and increments on `UpdateDestination`. The UUID is a full hyphenated UUID.
 
-An absent or empty prefix starts at `yyyy/MM/dd/HH/`. A prefix of `events/` produces `events/yyyy/MM/dd/HH/`; `events` produces `eventsyyyy/MM/dd/HH/`, without an inserted slash. Uncompressed output has no default extension. `FileExtension: ".custom.log"` appends `.custom.log`; an absent or empty override appends nothing. `FileExtension` must be empty or a dot followed by lowercase letters, digits, or `!-_.*'()`, with at most 128 characters; other values return `InvalidArgumentException` from `CreateDeliveryStream` and `UpdateDestination`, and make a CloudFormation `AWS::KinesisFirehose::DeliveryStream` resource fail.
+An absent or empty prefix starts at `yyyy/MM/dd/HH/`. A prefix of `events/` produces `events/yyyy/MM/dd/HH/`; `events` produces `eventsyyyy/MM/dd/HH/`, without an inserted slash.
+
+| `CompressionFormat` | Default extension | `Content-Encoding` |
+| --- | --- | --- |
+| `UNCOMPRESSED` (also the default when omitted) | None | None |
+| `GZIP` | `.gz` | `gzip` |
+
+Uncompressed output has no default extension. `FileExtension: ".custom.log"` replaces the default extension with `.custom.log`; an absent or empty override keeps the codec's default. Naming an object `.log` does not disable GZIP compression. `FileExtension` must be empty or a dot followed by lowercase letters, digits, or `!-_.*'()`, with at most 128 characters; other values return `InvalidArgumentException` from `CreateDeliveryStream` and `UpdateDestination`, and make a CloudFormation `AWS::KinesisFirehose::DeliveryStream` resource fail. `Content-Length` is the encoded object's byte length. S3 reads return the stored compressed bytes; decompress them to recover the original record bytes.
 
 ## Smoke test
 
@@ -111,7 +118,7 @@ See [`reference/introspection`](/docs/reference/introspection/) for the full end
 
 ## Caveats
 
-Only uncompressed S3 delivery is implemented. `CompressionFormat` still round-trips as configuration, but selecting GZIP, Snappy, or another codec does not encode the body or add a codec extension. Use `UNCOMPRESSED` when testing delivered objects.
+Only uncompressed and GZIP S3 delivery are implemented. Other `CompressionFormat` values still round-trip as configuration, but selecting Snappy or another unsupported codec does not encode the body or add a codec extension. Use `UNCOMPRESSED` or `GZIP` when testing delivered objects.
 
 Buffering hints do not aggregate separate calls or delay delivery. `Prefix` is used verbatim: `!{namespace:value}` expressions are not evaluated, so they appear literally in keys and the default `yyyy/MM/dd/HH/` hierarchy is still appended. Keys always use UTC; `CustomTimeZone` is stored but not applied. Processing configuration other than `AppendDelimiterToRecord` (Lambda and the other built-in processors), format conversion (Parquet/ORC), dynamic partitioning, delivered-object encryption, and S3 backup pipelines are configuration-only: records are written as received. Other destinations are not delivered to, and Firehose S3 writes do not dispatch S3 notifications.
 
