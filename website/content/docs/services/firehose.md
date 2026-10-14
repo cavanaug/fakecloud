@@ -36,6 +36,8 @@ The interval starts with the oldest arrival in a new buffer. After that buffer i
 
 Create the destination bucket before sending records. Records `abc`, `def\n`, and the binary bytes `00 ff` in one delivery window become exactly `abcdef\n` followed by `00 ff`, whether submitted in one batch or separate calls. For compressed output, those concatenated bytes are encoded in one GZIP or Xerial Snappy stream. Producers must supply their own delimiters, such as a newline for each JSON record, or enable `AppendDelimiterToRecord`, which writes the same records as exactly `abc\ndef\n\n` followed by `00 ff 0a` before any compression.
 
+CloudWatch Logs subscription records arrive as GZIP-compressed bytes, as on AWS: each delivery is one record holding one GZIP-compressed `DATA_MESSAGE` envelope, with no base64 layer. An object that buffers several deliveries is their GZIP members concatenated with no separator; a multi-member GZIP reader such as `gunzip` or `zcat` returns the JSON envelopes back to back. Choosing `GZIP` compression on the stream compresses those members again, as on AWS, which documents that this data needs no Firehose compression; decompress such an object once to recover the members.
+
 For a static prefix, the key format is:
 
 ```text

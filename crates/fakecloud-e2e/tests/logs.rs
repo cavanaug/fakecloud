@@ -2659,6 +2659,7 @@ def lambda_handler(event, context):
 
 #[tokio::test]
 async fn logs_subscription_filter_streams_to_kinesis() {
+    use std::io::Read;
     use tokio::time::{sleep, Duration};
 
     let server = TestServer::start().await;
@@ -2727,44 +2728,59 @@ async fn logs_subscription_filter_streams_to_kinesis() {
         .await
         .unwrap();
 
-    // Wait for async delivery
-    sleep(Duration::from_millis(500)).await;
+    // Bounded poll for the delivered record (fresh TRIM_HORIZON iterator per try).
+    let records = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let shard_iterator_resp = kinesis_client
+                .get_shard_iterator()
+                .stream_name("logs-kinesis-test")
+                .shard_id("shardId-000000000000")
+                .shard_iterator_type(aws_sdk_kinesis::types::ShardIteratorType::TrimHorizon)
+                .send()
+                .await
+                .unwrap();
+            let records_resp = kinesis_client
+                .get_records()
+                .shard_iterator(shard_iterator_resp.shard_iterator().unwrap())
+                .send()
+                .await
+                .unwrap();
+            if !records_resp.records().is_empty() {
+                return records_resp.records().to_vec();
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Kinesis subscription record within 10s");
 
-    // Get records from Kinesis stream
-    let shard_iterator_resp = kinesis_client
-        .get_shard_iterator()
-        .stream_name("logs-kinesis-test")
-        .shard_id("shardId-000000000000")
-        .shard_iterator_type(aws_sdk_kinesis::types::ShardIteratorType::TrimHorizon)
-        .send()
-        .await
-        .unwrap();
-    let shard_iterator = shard_iterator_resp.shard_iterator().unwrap();
-
-    let records_resp = kinesis_client
-        .get_records()
-        .shard_iterator(shard_iterator)
-        .send()
-        .await
-        .unwrap();
-
-    let records = records_resp.records();
     assert_eq!(
         records.len(),
         1,
         "Should have one batched record in Kinesis"
     );
 
-    // Decode the data - CloudWatch Logs sends gzipped+base64 data to Kinesis,
-    // but Kinesis stores it as raw bytes
+    // The record's Data is the GZIP-compressed envelope itself: the SDK has
+    // already removed GetRecords' JSON wire base64, so the bytes are exactly
+    // one GZIP member that decompresses with no further decoding.
     let data_blob = records[0].data().as_ref();
-
-    // Data is already stored as raw bytes in Kinesis (the gzipped data)
-    // So we just need to decompress it
-    let decompressed = helpers::gunzip(data_blob);
+    assert!(
+        data_blob.starts_with(&[0x1f, 0x8b, 0x08]),
+        "record Data must be raw GZIP bytes, got {:?}",
+        &data_blob[..data_blob.len().min(8)]
+    );
+    let mut decoder = flate2::bufread::GzDecoder::new(data_blob);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed).unwrap();
+    assert!(
+        decoder.into_inner().is_empty(),
+        "record Data must be exactly one GZIP member"
+    );
 
     let payload: Value = serde_json::from_slice(&decompressed).unwrap();
 
+    assert_eq!(payload["messageType"], "DATA_MESSAGE");
+    assert_eq!(payload["subscriptionFilters"][0], "kinesis-filter");
     assert_eq!(payload["logGroup"], "/kinesis-sub/test");
     assert_eq!(payload["logStream"], "stream-a");
 

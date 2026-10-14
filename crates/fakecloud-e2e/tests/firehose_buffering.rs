@@ -104,6 +104,25 @@ fn gunzip(raw: &[u8]) -> Vec<u8> {
     decoded
 }
 
+/// Decode every GZIP member of `raw` in order. There is no base64 layer: each
+/// member must start right where the previous one's trailer ends.
+fn gzip_members(mut raw: &[u8]) -> Vec<Vec<u8>> {
+    let mut members = Vec::new();
+    while !raw.is_empty() {
+        assert!(
+            raw.starts_with(&[0x1f, 0x8b, 8]),
+            "expected a raw GZIP member, got {:?}",
+            &raw[..raw.len().min(8)]
+        );
+        let mut decoder = flate2::bufread::GzDecoder::new(raw);
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        raw = decoder.into_inner();
+        members.push(decoded);
+    }
+    members
+}
+
 async fn object(s3: &aws_sdk_s3::Client, bucket: &str, key: &str, codec: &str) -> Vec<u8> {
     let object = s3
         .get_object()
@@ -705,11 +724,119 @@ async fn firehose_logs_and_api_share_one_size_buffer() {
     let bytes = object(&s3, bucket, &keys[0], "UNCOMPRESSED").await;
     assert!(bytes.len() >= 1_048_576);
     assert_eq!(&bytes[..1_024_000], [seed.clone(), seed].concat());
-    let envelope = base64::engine::general_purpose::STANDARD
-        .decode(&bytes[1_024_000..])
-        .unwrap();
-    let event: serde_json::Value = serde_json::from_slice(&gunzip(&envelope)).unwrap();
+    // The Logs record is the GZIP-compressed envelope itself, appended
+    // byte-for-byte after the API records.
+    let members = gzip_members(&bytes[1_024_000..]);
+    assert_eq!(members.len(), 1, "one Logs delivery, one GZIP member");
+    let event: serde_json::Value = serde_json::from_slice(&members[0]).unwrap();
     assert_eq!(event["messageType"], "DATA_MESSAGE");
     assert_eq!(event["logGroup"], "buffer-source");
     assert_eq!(event["logEvents"][0]["message"], message);
+}
+
+// CloudWatch Logs hands Firehose each subscription delivery as one record of
+// GZIP-compressed bytes, and buffering concatenates records byte-for-byte. Two
+// separate PutLogEvents deliveries buffered together therefore form one object
+// of two GZIP members, which any multi-member reader (`zcat`, MultiGzDecoder)
+// turns back into two DATA_MESSAGE envelopes.
+#[tokio::test]
+async fn firehose_buffers_separate_logs_deliveries_into_one_multi_member_gzip_object() {
+    let server = TestServer::start().await;
+    let fh = server.firehose_client().await;
+    let s3 = server.s3_client().await;
+    let logs = server.logs_client().await;
+    let bucket = "fh-logs-members";
+    s3.create_bucket().bucket(bucket).send().await.unwrap();
+    // The 300 s interval outlasts the test: only the 1 MiB threshold delivers.
+    create(&fh, "logs-members", destination(bucket, 300)).await;
+    logs.create_log_group()
+        .log_group_name("member-source")
+        .send()
+        .await
+        .unwrap();
+    logs.create_log_stream()
+        .log_group_name("member-source")
+        .log_stream_name("events")
+        .send()
+        .await
+        .unwrap();
+    logs.put_subscription_filter()
+        .log_group_name("member-source")
+        .filter_name("to-firehose")
+        .filter_pattern("")
+        .destination_arn("arn:aws:firehose:us-east-1:123456789012:deliverystream/logs-members")
+        .send()
+        .await
+        .unwrap();
+
+    // Base64 text of incompressible bytes carries 6 bits per character, so a
+    // call's GZIP member is at least 750,000 bytes and at most about its
+    // 1,000,000 JSON bytes: one delivery stays below 1 MiB, two cross it. Each
+    // 250,000-character event is within the 256 KiB event limit, and each call
+    // (4 events plus 26 bytes of overhead each) within the 1 MiB batch limit.
+    let messages: Vec<String> = xerial::incompressible_input(8 * 187_500)
+        .chunks(187_500)
+        .map(|chunk| base64::engine::general_purpose::STANDARD.encode(chunk))
+        .collect();
+    for (call, batch) in messages.chunks(4).enumerate() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut request = logs
+            .put_log_events()
+            .log_group_name("member-source")
+            .log_stream_name("events");
+        for (i, message) in batch.iter().enumerate() {
+            request = request.log_events(
+                aws_sdk_cloudwatchlogs::types::InputLogEvent::builder()
+                    .timestamp(now + i as i64)
+                    .message(message)
+                    .build()
+                    .unwrap(),
+            );
+        }
+        request.send().await.unwrap();
+        if call == 0 {
+            assert!(
+                keys(&s3, bucket).await.is_empty(),
+                "one delivery alone is below the size threshold"
+            );
+        }
+    }
+
+    let keys = wait_keys(&s3, bucket, 1).await;
+    let bytes = object(&s3, bucket, &keys[0], "UNCOMPRESSED").await;
+    assert!(bytes.len() >= 1_048_576);
+    let members = gzip_members(&bytes);
+    assert_eq!(
+        members.len(),
+        2,
+        "one GZIP member per PutLogEvents delivery"
+    );
+
+    let mut text = Vec::new();
+    flate2::read::MultiGzDecoder::new(&bytes[..])
+        .read_to_end(&mut text)
+        .unwrap();
+    assert!(text == members.concat(), "multi-member reader output");
+    let envelopes: Vec<serde_json::Value> = serde_json::Deserializer::from_slice(&text)
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(envelopes.len(), 2);
+    for (i, (envelope, batch)) in envelopes.iter().zip(messages.chunks(4)).enumerate() {
+        assert_eq!(envelope["messageType"], "DATA_MESSAGE");
+        assert_eq!(envelope["logGroup"], "member-source");
+        assert_eq!(envelope["logStream"], "events");
+        assert_eq!(
+            envelope["subscriptionFilters"],
+            serde_json::json!(["to-firehose"])
+        );
+        let events = envelope["logEvents"].as_array().unwrap();
+        assert!(
+            events
+                .iter()
+                .map(|event| event["message"].as_str().unwrap())
+                .eq(batch.iter().map(String::as_str)),
+            "envelope {i} must carry exactly its delivery's messages in order"
+        );
+    }
 }

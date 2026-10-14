@@ -5,7 +5,6 @@ use aws_sdk_firehose::types::{
     BufferingHints, CompressionFormat, ExtendedS3DestinationConfiguration, ProcessingConfiguration,
     Processor, ProcessorType, Record, S3DestinationConfiguration,
 };
-use base64::Engine;
 use fakecloud_testkit::TestServer;
 use md5::{Digest, Md5};
 
@@ -322,12 +321,10 @@ async fn firehose_gzip_public_and_internal_objects_survive_restart() {
     let direct_before = gzip_object(&s3, bucket, "direct/", ".gz").await;
     assert_eq!(direct_before.2, b"\x00\xffpersist\n");
     let hook_before = gzip_object(&s3, bucket, "hook/", ".gz").await;
-    // The adapter's existing Logs payload is a base64-encoded GZIP envelope.
-    // The Firehose GZIP layer must preserve those producer bytes verbatim.
-    let envelope = base64::engine::general_purpose::STANDARD
-        .decode(&hook_before.2)
-        .unwrap();
-    let event: serde_json::Value = serde_json::from_slice(&decode_gzip(&envelope)).unwrap();
+    // A Logs record is already a GZIP-compressed envelope, so a GZIP stream
+    // compresses it a second time, as on AWS. The Firehose layer must preserve
+    // that producer GZIP member verbatim inside its own.
+    let event: serde_json::Value = serde_json::from_slice(&decode_gzip(&hook_before.2)).unwrap();
     assert_eq!(event["messageType"], "DATA_MESSAGE");
     assert_eq!(event["logGroup"], "gzip-source");
     assert_eq!(event["logStream"], "events");

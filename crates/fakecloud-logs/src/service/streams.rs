@@ -675,9 +675,11 @@ impl LogsService {
     /// Apply a subscription filter's pattern to a batch of accepted log
     /// events and deliver the matches to the filter's destination ARN.
     /// CloudWatch wraps the matches in the documented DATA_MESSAGE
-    /// envelope, gzip-compresses it, and base64-encodes the result;
-    /// every destination flavour (SQS, Lambda, Kinesis) consumes that
-    /// same payload but expects a different wire shape.
+    /// envelope and gzip-compresses it. Kinesis and Firehose records carry
+    /// those GZIP bytes themselves; only Lambda's JSON event wraps them in
+    /// base64 (`{"awslogs":{"data":"<base64>"}}`). SQS, which AWS does not
+    /// offer as a subscription destination, gets the base64 text as the
+    /// message body because SQS bodies are text.
     fn deliver_to_subscription_filter(
         &self,
         filter_name: &str,
@@ -720,15 +722,15 @@ impl LogsService {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(payload_str.as_bytes()).unwrap();
         let compressed = encoder.finish().unwrap();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+        let base64_text = || base64::engine::general_purpose::STANDARD.encode(&compressed);
 
         if destination_arn.contains(":sqs:") {
             self.delivery_bus
-                .send_to_sqs(destination_arn, &encoded, &HashMap::new());
+                .send_to_sqs(destination_arn, &base64_text(), &HashMap::new());
         } else if destination_arn.contains(":lambda:") {
             let lambda_event = json!({
                 "awslogs": {
-                    "data": encoded,
+                    "data": base64_text(),
                 }
             });
             let lambda_payload = serde_json::to_string(&lambda_event).unwrap();
@@ -756,15 +758,20 @@ impl LogsService {
                 }
             });
         } else if destination_arn.contains(":kinesis:") {
+            // The record's Data is the GZIP bytes; base64 appears only in
+            // GetRecords' JSON wire encoding, which SDKs decode. The
+            // `KinesisDelivery` handoff is a `&str` that carries binary data
+            // as base64 transport and is decoded before the record is stored.
             let partition_key = format!("{}-{}", group_name, stream_name);
             self.delivery_bus
-                .send_to_kinesis(destination_arn, &encoded, &partition_key);
+                .send_to_kinesis(destination_arn, &base64_text(), &partition_key);
         } else if destination_arn.contains(":firehose:") {
-            // Firehose subscriptions get the same gzip+base64 envelope
-            // Lambda/Kinesis subscribers see, so a downstream consumer
-            // can decode with the standard CloudWatch-Logs format.
+            // The Firehose record is the GZIP bytes themselves ("already
+            // compressed with gzip"), so buffering several deliveries into
+            // one S3 object yields concatenated GZIP members, readable with
+            // any multi-member reader such as `zcat`.
             self.delivery_bus
-                .put_record_to_firehose(destination_arn, encoded.as_bytes());
+                .put_record_to_firehose(destination_arn, &compressed);
         }
     }
 
@@ -3147,6 +3154,226 @@ mod tests {
         assert_eq!(
             source["deliverySource"]["arn"],
             "arn:aws-cn:logs:cn-north-1:123456789012:delivery-source:cn-src"
+        );
+    }
+
+    // ---- Subscription filter delivery payloads ----
+
+    const SUB_FIREHOSE_ARN: &str = "arn:aws:firehose:us-east-1:123456789012:deliverystream/sub";
+    const SUB_KINESIS_ARN: &str = "arn:aws:kinesis:us-east-1:123456789012:stream/sub";
+    const SUB_LAMBDA_ARN: &str = "arn:aws:lambda:us-east-1:123456789012:function:sub";
+
+    /// Records exactly what each subscription destination is handed.
+    #[derive(Default)]
+    struct SubscriptionRecorder {
+        firehose: parking_lot::Mutex<Vec<(String, Vec<u8>)>>,
+        kinesis: parking_lot::Mutex<Vec<(String, String)>>,
+        lambda: parking_lot::Mutex<Vec<(String, String)>>,
+    }
+
+    impl fakecloud_core::delivery::FirehoseDelivery for SubscriptionRecorder {
+        fn put_record(&self, delivery_stream_arn: &str, data: &[u8]) {
+            self.firehose
+                .lock()
+                .push((delivery_stream_arn.to_string(), data.to_vec()));
+        }
+    }
+
+    impl fakecloud_core::delivery::KinesisDelivery for SubscriptionRecorder {
+        fn put_record(&self, stream_arn: &str, data: &str, _partition_key: &str) {
+            self.kinesis
+                .lock()
+                .push((stream_arn.to_string(), data.to_string()));
+        }
+    }
+
+    impl fakecloud_core::delivery::LambdaDelivery for SubscriptionRecorder {
+        fn invoke_lambda(
+            &self,
+            function_arn: &str,
+            payload: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>
+        {
+            self.lambda
+                .lock()
+                .push((function_arn.to_string(), payload.to_string()));
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn make_service_with_subscriptions(
+        recorder: &std::sync::Arc<SubscriptionRecorder>,
+    ) -> LogsService {
+        use fakecloud_core::delivery::DeliveryBus;
+        let state = std::sync::Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let bus = DeliveryBus::new()
+            .with_firehose(recorder.clone())
+            .with_kinesis(recorder.clone())
+            .with_lambda(recorder.clone());
+        LogsService::new(state, std::sync::Arc::new(bus))
+    }
+
+    fn subscribe(svc: &LogsService, group: &str, filter: &str, destination: &str) {
+        let req = make_request(
+            "PutSubscriptionFilter",
+            json!({
+                "logGroupName": group,
+                "filterName": filter,
+                "filterPattern": "",
+                "destinationArn": destination,
+            }),
+        );
+        svc.put_subscription_filter(&req).unwrap();
+    }
+
+    /// Decode exactly one GZIP member (no base64 layer) into its JSON envelope.
+    fn gunzip_one_envelope(raw: &[u8]) -> Value {
+        use std::io::Read;
+        assert!(
+            raw.starts_with(&[0x1f, 0x8b, 0x08]),
+            "expected raw GZIP bytes, got {:?}",
+            &raw[..raw.len().min(8)]
+        );
+        let mut decoder = flate2::bufread::GzDecoder::new(raw);
+        let mut json = Vec::new();
+        decoder.read_to_end(&mut json).unwrap();
+        assert!(
+            decoder.into_inner().is_empty(),
+            "expected exactly one GZIP member"
+        );
+        serde_json::from_slice(&json).unwrap()
+    }
+
+    fn assert_data_message(envelope: &Value, group: &str, filter: &str, messages: &[&str]) {
+        assert_eq!(envelope["messageType"], "DATA_MESSAGE");
+        assert_eq!(envelope["owner"], "123456789012");
+        assert_eq!(envelope["logGroup"], group);
+        assert_eq!(envelope["logStream"], "s1");
+        assert_eq!(envelope["subscriptionFilters"], json!([filter]));
+        let got: Vec<&str> = envelope["logEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, messages);
+    }
+
+    // AWS: "Data sent from CloudWatch Logs to Amazon Data Firehose is already
+    // compressed with gzip", and an UNCOMPRESSED stream's S3 object is read
+    // with `zcat`. Each delivery is one record of raw GZIP bytes, so a
+    // buffered object of several deliveries is concatenated GZIP members.
+    #[test]
+    fn subscription_firehose_records_are_raw_gzip_members() {
+        use std::io::Read;
+        let recorder = std::sync::Arc::new(SubscriptionRecorder::default());
+        let svc = make_service_with_subscriptions(&recorder);
+        create_group(&svc, "sub-fh");
+        create_stream(&svc, "sub-fh", "s1");
+        subscribe(&svc, "sub-fh", "to-firehose", SUB_FIREHOSE_ARN);
+
+        put_events(&svc, "sub-fh", "s1", &["first", "second"]);
+        put_events(&svc, "sub-fh", "s1", &["third"]);
+
+        let records = recorder.firehose.lock().clone();
+        assert_eq!(records.len(), 2, "one Firehose record per delivery");
+        assert!(records.iter().all(|(arn, _)| arn == SUB_FIREHOSE_ARN));
+        assert_data_message(
+            &gunzip_one_envelope(&records[0].1),
+            "sub-fh",
+            "to-firehose",
+            &["first", "second"],
+        );
+        assert_data_message(
+            &gunzip_one_envelope(&records[1].1),
+            "sub-fh",
+            "to-firehose",
+            &["third"],
+        );
+
+        // Byte-for-byte concatenation (what Firehose buffering writes) is
+        // readable with a standard multi-member GZIP reader.
+        let object = [records[0].1.clone(), records[1].1.clone()].concat();
+        let mut text = Vec::new();
+        flate2::read::MultiGzDecoder::new(&object[..])
+            .read_to_end(&mut text)
+            .unwrap();
+        let envelopes: Vec<Value> = serde_json::Deserializer::from_slice(&text)
+            .into_iter::<Value>()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(envelopes.len(), 2);
+        assert_data_message(&envelopes[1], "sub-fh", "to-firehose", &["third"]);
+    }
+
+    // The Kinesis record's Data is the GZIP bytes themselves; base64 only
+    // appears in the GetRecords JSON wire encoding, which SDKs decode. The
+    // `KinesisDelivery` handoff carries binary data as base64 text that the
+    // Kinesis side decodes before storing, so exactly one base64 layer may
+    // sit on top of the raw GZIP member.
+    #[test]
+    fn subscription_kinesis_record_data_is_raw_gzip() {
+        use base64::Engine;
+        let recorder = std::sync::Arc::new(SubscriptionRecorder::default());
+        let svc = make_service_with_subscriptions(&recorder);
+        create_group(&svc, "sub-kds");
+        create_stream(&svc, "sub-kds", "s1");
+        subscribe(&svc, "sub-kds", "to-kinesis", SUB_KINESIS_ARN);
+
+        put_events(&svc, "sub-kds", "s1", &["kinesis event"]);
+
+        let records = recorder.kinesis.lock().clone();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, SUB_KINESIS_ARN);
+        let stored = base64::engine::general_purpose::STANDARD
+            .decode(&records[0].1)
+            .expect("KinesisDelivery handoff is base64 transport");
+        assert_data_message(
+            &gunzip_one_envelope(&stored),
+            "sub-kds",
+            "to-kinesis",
+            &["kinesis event"],
+        );
+    }
+
+    // Lambda is the one destination AWS documents as base64 text:
+    // `{"awslogs": {"data": "BASE64ENCODED_GZIP_COMPRESSED_DATA"}}`.
+    #[tokio::test]
+    async fn subscription_lambda_event_keeps_base64_awslogs_data() {
+        use base64::Engine;
+        let recorder = std::sync::Arc::new(SubscriptionRecorder::default());
+        let svc = make_service_with_subscriptions(&recorder);
+        create_group(&svc, "sub-fn");
+        create_stream(&svc, "sub-fn", "s1");
+        subscribe(&svc, "sub-fn", "to-lambda", SUB_LAMBDA_ARN);
+
+        put_events(&svc, "sub-fn", "s1", &["lambda event"]);
+
+        // The invocation is spawned; wait (bounded) for it to be handed over.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while recorder.lambda.lock().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("Lambda subscription invocation within 5s");
+        let invocations = recorder.lambda.lock().clone();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].0, SUB_LAMBDA_ARN);
+        let event: Value = serde_json::from_str(&invocations[0].1).unwrap();
+        assert_eq!(event.as_object().unwrap().len(), 1);
+        assert_eq!(event["awslogs"].as_object().unwrap().len(), 1);
+        let data = event["awslogs"]["data"].as_str().expect("base64 string");
+        let compressed = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        assert_data_message(
+            &gunzip_one_envelope(&compressed),
+            "sub-fn",
+            "to-lambda",
+            &["lambda event"],
         );
     }
 }

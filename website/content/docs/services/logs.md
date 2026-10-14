@@ -15,7 +15,7 @@ fakecloud implements **115 of 115** CloudWatch Logs operations at 100% Smithy co
 - **Field indexes** — `DescribeFieldIndexes` returns fields parsed from indexed log events, not stubs
 - **GetLogGroupFields** — real field discovery from indexed events
 - **ListLogGroupsForQuery** — real list filtered by query string
-- **Subscription filters** — delivery to Lambda, Kinesis, SQS
+- **Subscription filters** — delivery to Lambda, Kinesis, Firehose, SQS. Each delivery is one GZIP-compressed `DATA_MESSAGE` envelope: Kinesis record `Data` and Firehose records are the GZIP bytes themselves (base64 appears only in JSON wire encodings, which SDKs decode), Lambda receives them base64-encoded as `{"awslogs":{"data":"..."}}`, and SQS, which AWS does not offer as a subscription destination, receives the base64 text as the message body
 - **Query language**: StartQuery, GetQueryResults with full Insights query syntax; the `startTime`/`endTime` window is inclusive, and a finished query's results are computed once and served as a snapshot on later polls
 - **Metric filters** — CRUD, extraction patterns
 - **Resource policies** — CRUD
@@ -33,7 +33,7 @@ JSON protocol. `X-Amz-Target` header, JSON body, JSON responses.
 
 ## Cross-service delivery
 
-- **CloudWatch Logs -> Lambda / Kinesis / SQS** — Subscription filters deliver log events
+- **CloudWatch Logs -> Lambda / Kinesis / Firehose / SQS** — Subscription filters deliver log events
 
 ## Admin / introspection
 
