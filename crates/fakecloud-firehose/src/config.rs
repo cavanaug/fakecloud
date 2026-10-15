@@ -332,9 +332,14 @@ mod tests {
                 .compression,
             Compression::Uncompressed
         );
-        for codec in ["ZIP", "HADOOP_SNAPPY", "SNAPPY"] {
+        for codec in ["ZIP", "HADOOP_SNAPPY"] {
             unsupported(&destination(json!({"CompressionFormat": codec})));
         }
+        // Invalid enum strings are now rejected by control-plane parsing, but
+        // preflight must still refuse one restored from an older snapshot.
+        let mut legacy = destination(json!({}));
+        legacy.compression_format = Some("SNAPPY".into());
+        unsupported(&legacy);
         unsupported(&destination(json!({"Prefix": "!{timestamp:yyyy}/"})));
         unsupported(&destination(json!({"CustomTimeZone": "America/New_York"})));
         for partition in ["aws", "aws-cn", "aws-us-gov"] {

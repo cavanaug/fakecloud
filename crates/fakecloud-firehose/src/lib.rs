@@ -14,7 +14,7 @@ pub use config::{buffering_policy, delivery_config, BufferingPolicy, DeliveryCon
 pub use delivery::FirehoseDeliveryImpl;
 pub use engine::{DrainReport, FirehoseEngine, WorkerAlreadyStarted};
 pub use output::{Compression, OutputConfig};
-pub use service::FirehoseService;
+pub use service::{validate_s3_compression, FirehoseService};
 pub use state::{
     DeliveryStream, FirehoseAccounts, FirehoseSnapshot, S3Destination, SharedFirehoseState,
     StreamKey, FIREHOSE_SNAPSHOT_SCHEMA_VERSION,

@@ -1467,7 +1467,6 @@ impl CloudFormationService {
                     );
                     let sid = stack.stack_id.clone();
                     let sname = stack.name.clone();
-                    stack.template = template_body.clone();
                     stack.status = match (was_review, result.is_err()) {
                         (true, false) => "CREATE_COMPLETE",
                         (true, true) => "ROLLBACK_COMPLETE",
@@ -1479,17 +1478,24 @@ impl CloudFormationService {
                     // clear any reason left by an earlier failure, and a
                     // rollback must say why it rolled back.
                     stack.status_reason = result.as_ref().err().map(ToString::to_string);
-                    stack.parameters = cs_params.clone();
-                    if !cs_tags.is_empty() {
-                        stack.tags = cs_tags;
-                    }
-                    if !cs_notif.is_empty() {
-                        stack.notification_arns = cs_notif;
-                    }
                     stack.updated_at = Some(Utc::now());
-                    // Outputs are resolved below from the provisioned resources;
-                    // clear stale values now so a failed run leaves none behind.
-                    stack.outputs.clear();
+                    if was_review || result.is_ok() {
+                        // Failed updates retain the last successful metadata,
+                        // so an identical retry still reaches validation. CREATE
+                        // has no previously applied template; keep its submitted
+                        // metadata on failure as before. No physical rollback is
+                        // attempted here for partially applied resource updates.
+                        stack.template = template_body.clone();
+                        stack.parameters = cs_params.clone();
+                        if !cs_tags.is_empty() {
+                            stack.tags = cs_tags;
+                        }
+                        if !cs_notif.is_empty() {
+                            stack.notification_arns = cs_notif;
+                        }
+                        // Successful executions resolve their outputs below.
+                        stack.outputs.clear();
+                    }
                     let resources_snapshot = stack.resources.clone();
                     (result, sid, sname, was_review, resources_snapshot)
                 };
