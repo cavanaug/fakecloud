@@ -2322,6 +2322,339 @@ mod tests {
         .unwrap();
     }
 
+    fn kinesis_source_body(name: &str) -> Value {
+        json!({
+            "DeliveryStreamName": name,
+            "DeliveryStreamType": "KinesisStreamAsSource",
+            "KinesisStreamSourceConfiguration": {
+                "KinesisStreamARN": "arn:aws:kinesis:us-east-1:123456789012:stream/source",
+                "RoleARN": "arn:aws:iam::123456789012:role/fh",
+            },
+            "ExtendedS3DestinationConfiguration": {
+                "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                "BucketARN": "arn:aws:s3:::fh-bucket",
+            },
+        })
+    }
+
+    fn record_request(action: &str, name: &str) -> AwsRequest {
+        let mut body = json!({ "DeliveryStreamName": name });
+        if action == "PutRecord" {
+            body["Record"] = json!({ "Data": "eA==" });
+        } else {
+            body["Records"] = json!([{ "Data": "eA==" }]);
+        }
+        request(action, body)
+    }
+
+    fn assert_source_rejected(err: AwsServiceError) {
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.code(), "InvalidArgumentException");
+        assert_eq!(
+            err.message(),
+            "This operation is not permitted on KinesisStreamAsSource delivery stream type."
+        );
+    }
+
+    fn assert_source_bucket_empty(s3_state: &SharedS3State, disk: &dyn S3Store) {
+        let s3 = s3_state.read();
+        assert!(s3.get(S3_ACCOUNT).unwrap().buckets["fh-bucket"]
+            .objects
+            .is_empty());
+        assert!(disk.load().unwrap().buckets["fh-bucket"].objects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_record_rejects_kinesis_source_without_s3_side_effects() {
+        let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            kinesis_source_body("source-stream"),
+        ))
+        .unwrap();
+
+        assert_source_rejected(
+            svc.put_record(&record_request("PutRecord", "source-stream"))
+                .err()
+                .expect("source streams must reject PutRecord"),
+        );
+        assert_eq!(
+            svc.delivery_engine().shutdown().await,
+            crate::DrainReport::default()
+        );
+        assert_source_bucket_empty(&s3_state, disk.as_ref());
+    }
+
+    #[tokio::test]
+    async fn put_record_batch_rejects_kinesis_source_without_s3_side_effects() {
+        let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            kinesis_source_body("source-stream"),
+        ))
+        .unwrap();
+
+        for records in [
+            json!([{ "Data": "eA==" }]),
+            json!([{ "Data": "eA==" }, { "Data": "@@@" }]),
+        ] {
+            assert_source_rejected(
+                svc.put_record_batch(&request(
+                    "PutRecordBatch",
+                    json!({ "DeliveryStreamName": "source-stream", "Records": records }),
+                ))
+                .err()
+                .expect("source streams must reject PutRecordBatch"),
+            );
+        }
+        assert_eq!(
+            svc.delivery_engine().shutdown().await,
+            crate::DrainReport::default()
+        );
+        assert_source_bucket_empty(&s3_state, disk.as_ref());
+    }
+
+    #[tokio::test]
+    async fn put_record_batch_rejects_kinesis_source_without_deliverable_records() {
+        let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            kinesis_source_body("source-stream"),
+        ))
+        .unwrap();
+
+        let err = svc
+            .put_record_batch(&request(
+                "PutRecordBatch",
+                json!({
+                    "DeliveryStreamName": "source-stream", "Records": []
+                }),
+            ))
+            .err()
+            .expect("empty batches must fail request-wide validation");
+        assert_eq!(err.code(), "InvalidArgumentException");
+        for records in [json!([{ "Data": "@@@" }, {}]), json!([{ "Data": "" }])] {
+            assert_source_rejected(
+                svc.put_record_batch(&request(
+                    "PutRecordBatch",
+                    json!({ "DeliveryStreamName": "source-stream", "Records": records }),
+                ))
+                .err()
+                .expect("all-invalid/empty-data batches must not bypass source admission"),
+            );
+        }
+        assert_eq!(
+            svc.delivery_engine().shutdown().await,
+            crate::DrainReport::default()
+        );
+        assert_source_bucket_empty(&s3_state, disk.as_ref());
+    }
+
+    #[test]
+    fn source_admission_precedes_destination_and_backend_checks() {
+        for with_backend in [false, true] {
+            for destination in ["s3", "http", "none"] {
+                let (mut svc, _s3_state, _disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+                if !with_backend {
+                    svc = service();
+                }
+                let mut body = kinesis_source_body("source-stream");
+                if destination != "s3" {
+                    body["ExtendedS3DestinationConfiguration"] = Value::Null;
+                }
+                if destination == "http" {
+                    body["HttpEndpointDestinationConfiguration"] = json!({
+                        "EndpointConfiguration": { "Url": "https://example.com/ingest" },
+                        "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                    });
+                }
+                svc.create_delivery_stream(&request("CreateDeliveryStream", body))
+                    .unwrap();
+                for action in ["PutRecord", "PutRecordBatch"] {
+                    let req = record_request(action, "source-stream");
+                    let result = if action == "PutRecord" {
+                        svc.put_record(&req)
+                    } else {
+                        svc.put_record_batch(&req)
+                    };
+                    assert_source_rejected(result.err().expect("source admission is required"));
+                }
+                for datas in [vec![], vec![b"x".to_vec()]] {
+                    assert_source_rejected(
+                        svc.deliver_records(S3_ACCOUNT, "us-east-1", "source-stream", datas)
+                            .expect_err("shared delivery must reject before backend checks"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_delivery_hook_rejects_kinesis_source_without_s3_side_effects() {
+        use fakecloud_core::delivery::FirehoseDelivery;
+
+        let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            kinesis_source_body("source-stream"),
+        ))
+        .unwrap();
+        create_s3_stream(&svc, "direct-stream", "fh-bucket");
+        let hook = crate::FirehoseDeliveryImpl::with_engine(svc.delivery_engine());
+        hook.set_s3_store(disk.clone());
+
+        hook.put_record(
+            "arn:aws:firehose:us-east-1:123456789012:deliverystream/source-stream",
+            b"must not deliver",
+        );
+        assert_source_bucket_empty(&s3_state, disk.as_ref());
+
+        hook.put_record(
+            "arn:aws:firehose:us-east-1:123456789012:deliverystream/direct-stream",
+            b"x",
+        );
+        let report = svc.delivery_engine().shutdown().await;
+        assert_eq!(report.delivered_batches, 1);
+        assert_eq!(report.undelivered_records, 0);
+        let s3 = s3_state.read();
+        let objects = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-bucket"].objects;
+        assert_eq!(objects.len(), 1, "DirectPut hook still delivers");
+        assert_eq!(objects.values().next().unwrap().size, 1);
+        assert_eq!(
+            disk.open_object_body(&objects.values().next().unwrap().body)
+                .unwrap()
+                .as_ref(),
+            b"x"
+        );
+        assert_eq!(disk.load().unwrap().buckets["fh-bucket"].objects.len(), 1);
+    }
+
+    #[test]
+    fn source_admission_is_account_and_region_isolated_for_same_names() {
+        let svc = service();
+        let scopes = [
+            (S3_ACCOUNT, "us-east-1", "KinesisStreamAsSource"),
+            (S3_ACCOUNT, "us-west-2", "DirectPut"),
+            ("222222222222", "us-east-1", "DirectPut"),
+            ("222222222222", "us-west-2", "KinesisStreamAsSource"),
+        ];
+        for (account, region, stream_type) in scopes {
+            let mut req = request(
+                "CreateDeliveryStream",
+                json!({ "DeliveryStreamName": "same-name", "DeliveryStreamType": stream_type }),
+            );
+            req.account_id = account.to_string();
+            req.region = region.to_string();
+            svc.create_delivery_stream(&req).unwrap();
+        }
+        for (account, region, stream_type) in scopes {
+            for action in ["PutRecord", "PutRecordBatch"] {
+                let mut req = record_request(action, "same-name");
+                req.account_id = account.to_string();
+                req.region = region.to_string();
+                let result = if action == "PutRecord" {
+                    svc.put_record(&req)
+                } else {
+                    svc.put_record_batch(&req)
+                };
+                if stream_type == "DirectPut" {
+                    assert_eq!(result.unwrap().status, StatusCode::OK);
+                } else {
+                    assert_source_rejected(result.err().expect("scoped source stream rejects"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn record_admission_preserves_scoped_resource_not_found() {
+        let svc = service();
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            kinesis_source_body("source-stream"),
+        ))
+        .unwrap();
+        for (account, region, name) in [
+            ("222222222222", "us-east-1", "source-stream"),
+            (S3_ACCOUNT, "us-west-2", "source-stream"),
+            (S3_ACCOUNT, "us-east-1", "missing-stream"),
+        ] {
+            for action in ["PutRecord", "PutRecordBatch"] {
+                let mut req = record_request(action, name);
+                req.account_id = account.to_string();
+                req.region = region.to_string();
+                let result = if action == "PutRecord" {
+                    svc.put_record(&req)
+                } else {
+                    svc.put_record_batch(&req)
+                };
+                let err = result.err().expect("stream is absent in this scope");
+                assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(err.code(), "ResourceNotFoundException");
+                assert_eq!(err.message(), format!("DeliveryStream {name} not found"));
+            }
+            let err = svc
+                .deliver_records(account, region, name, vec![])
+                .expect_err("shared delivery also checks scoped existence");
+            assert_eq!(err.code(), "ResourceNotFoundException");
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_put_record_and_batch_keep_success_and_partial_failure_behavior() {
+        let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+        create_s3_stream(&svc, "direct-stream", "fh-bucket");
+        let resp = svc
+            .put_record(&record_request("PutRecord", "direct-stream"))
+            .unwrap();
+        assert_eq!(resp.status, StatusCode::OK);
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert!(!body["RecordId"].as_str().unwrap().is_empty());
+
+        for (records, failed) in [
+            (json!([{ "Data": "eA==" }, { "Data": "@@@" }]), 1),
+            (json!([{ "Data": "@@@" }]), 1),
+        ] {
+            let resp = svc
+                .put_record_batch(&request(
+                    "PutRecordBatch",
+                    json!({ "DeliveryStreamName": "direct-stream", "Records": records }),
+                ))
+                .unwrap();
+            assert_eq!(resp.status, StatusCode::OK);
+            let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+            assert_eq!(body["FailedPutCount"], failed);
+            assert_eq!(
+                body["RequestResponses"].as_array().unwrap().len(),
+                records.as_array().unwrap().len()
+            );
+            if records.as_array().unwrap().len() == 2 {
+                assert!(!body["RequestResponses"][0]["RecordId"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    body["RequestResponses"][1]["ErrorCode"],
+                    "InvalidArgumentException"
+                );
+            }
+        }
+        assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
+        let s3 = s3_state.read();
+        assert_eq!(
+            s3.get(S3_ACCOUNT).unwrap().buckets["fh-bucket"]
+                .objects
+                .len(),
+            1
+        );
+        assert_eq!(disk.load().unwrap().buckets["fh-bucket"].objects.len(), 1);
+        drop(s3);
+        assert_eq!(
+            delivered_bodies(&s3_state, &disk, "fh-bucket"),
+            vec![b"xx".to_vec()]
+        );
+    }
+
     #[tokio::test]
     async fn snappy_delivery_uses_the_modeled_enum_and_xerial_metadata() {
         use crate::test_xerial_decoder::{decode, multiblock_input};

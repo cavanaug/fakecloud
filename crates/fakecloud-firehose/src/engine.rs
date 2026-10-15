@@ -240,9 +240,18 @@ impl FirehoseEngine {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "ResourceNotFoundException",
-                    format!("Delivery stream {name} not found"),
+                    format!("DeliveryStream {name} not found"),
                 )
             })?;
+        // API puts and internal delivery hooks are DirectPut producers. Reject
+        // source streams before destination checks or buffered record admission.
+        if stream.stream_type == "KinesisStreamAsSource" {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgumentException",
+                "This operation is not permitted on KinesisStreamAsSource delivery stream type.",
+            ));
+        }
         // Non-S3 streams retain the existing configuration-only acknowledgement.
         let Some(destination) = &stream.destination else {
             return Ok(());

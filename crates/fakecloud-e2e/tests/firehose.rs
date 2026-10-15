@@ -1,5 +1,8 @@
 use aws_sdk_firehose::primitives::Blob;
-use aws_sdk_firehose::types::{BufferingHints, ExtendedS3DestinationConfiguration, Record};
+use aws_sdk_firehose::types::{
+    BufferingHints, DeliveryStreamType, ExtendedS3DestinationConfiguration,
+    KinesisStreamSourceConfiguration, Record,
+};
 use aws_sdk_s3::types::CreateBucketConfiguration;
 use fakecloud_testkit::TestServer;
 
@@ -47,6 +50,177 @@ fn ext_s3(bucket_arn: &str) -> ExtendedS3DestinationConfiguration {
         )
         .build()
         .unwrap()
+}
+
+fn assert_kinesis_source_error<E>(err: aws_sdk_firehose::error::SdkError<E>)
+where
+    E: std::fmt::Debug + aws_sdk_firehose::error::ProvideErrorMetadata,
+{
+    let aws_sdk_firehose::error::SdkError::ServiceError(context) = err else {
+        panic!("expected an AWS service error, got {err:?}");
+    };
+    assert_eq!(context.raw().status().as_u16(), 400);
+    assert_eq!(context.err().code(), Some("InvalidArgumentException"));
+    assert_eq!(
+        context.err().message(),
+        Some("This operation is not permitted on KinesisStreamAsSource delivery stream type.")
+    );
+}
+
+#[tokio::test]
+async fn firehose_kinesis_source_rejects_puts_and_direct_put_still_delivers() {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let server = TestServer::start().await;
+        let firehose = setup(&server, "fh-source-admission").await;
+        let s3 = server.s3_client().await;
+        let kinesis = server.kinesis_client().await;
+        kinesis
+            .create_stream()
+            .stream_name("fh-source")
+            .shard_count(1)
+            .send()
+            .await
+            .expect("create Kinesis source");
+        let source = kinesis
+            .describe_stream_summary()
+            .stream_name("fh-source")
+            .send()
+            .await
+            .expect("describe Kinesis source");
+        firehose
+            .create_delivery_stream()
+            .delivery_stream_name("fh-source-stream")
+            .delivery_stream_type(DeliveryStreamType::KinesisStreamAsSource)
+            .kinesis_stream_source_configuration(
+                KinesisStreamSourceConfiguration::builder()
+                    .kinesis_stream_arn(source.stream_description_summary().unwrap().stream_arn())
+                    .role_arn("arn:aws:iam::123456789012:role/firehose")
+                    .build()
+                    .unwrap(),
+            )
+            .extended_s3_destination_configuration(ext_s3("arn:aws:s3:::fh-source-admission"))
+            .send()
+            .await
+            .expect("create Kinesis-source Firehose stream");
+        let description = firehose
+            .describe_delivery_stream()
+            .delivery_stream_name("fh-source-stream")
+            .send()
+            .await
+            .expect("describe source delivery stream");
+        assert_eq!(
+            description
+                .delivery_stream_description()
+                .unwrap()
+                .delivery_stream_type(),
+            &DeliveryStreamType::KinesisStreamAsSource
+        );
+
+        let record = |data: &[u8]| Record::builder().data(Blob::new(data)).build().unwrap();
+        assert_kinesis_source_error(
+            firehose
+                .put_record()
+                .delivery_stream_name("fh-source-stream")
+                .record(record(b"rejected-single"))
+                .send()
+                .await
+                .expect_err("source stream rejects PutRecord"),
+        );
+        assert_kinesis_source_error(
+            firehose
+                .put_record_batch()
+                .delivery_stream_name("fh-source-stream")
+                .records(record(b"rejected-a"))
+                .records(record(b"rejected-b"))
+                .send()
+                .await
+                .expect_err("source stream rejects PutRecordBatch"),
+        );
+        let listing = s3
+            .list_objects_v2()
+            .bucket("fh-source-admission")
+            .send()
+            .await
+            .expect("list after rejected puts");
+        assert!(
+            listing.contents().is_empty(),
+            "rejected puts must not write S3"
+        );
+
+        firehose
+            .create_delivery_stream()
+            .delivery_stream_name("fh-direct-control")
+            .delivery_stream_type(DeliveryStreamType::DirectPut)
+            .extended_s3_destination_configuration(ext_s3("arn:aws:s3:::fh-source-admission"))
+            .send()
+            .await
+            .expect("create DirectPut control");
+        let single = firehose
+            .put_record()
+            .delivery_stream_name("fh-direct-control")
+            .record(record(b"direct-single"))
+            .send()
+            .await
+            .expect("DirectPut PutRecord succeeds");
+        assert!(!single.record_id().is_empty());
+        let batch = firehose
+            .put_record_batch()
+            .delivery_stream_name("fh-direct-control")
+            .records(record(b"direct-a"))
+            .records(record(b"direct-b"))
+            .send()
+            .await
+            .expect("DirectPut PutRecordBatch succeeds");
+        assert_eq!(batch.failed_put_count(), 0);
+        assert_eq!(batch.request_responses().len(), 2);
+        assert!(batch
+            .request_responses()
+            .iter()
+            .all(|r| r.record_id().is_some_and(|id| !id.is_empty())));
+
+        let listing = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let listing = s3
+                    .list_objects_v2()
+                    .bucket("fh-source-admission")
+                    .send()
+                    .await
+                    .unwrap();
+                if listing.contents().len() == 2 {
+                    return listing;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("two DirectPut deliveries within 10s");
+        let mut payloads = Vec::new();
+        for object in listing.contents() {
+            let delivered = s3
+                .get_object()
+                .bucket("fh-source-admission")
+                .key(object.key().unwrap())
+                .send()
+                .await
+                .expect("read DirectPut object");
+            payloads.push(
+                delivered
+                    .body
+                    .collect()
+                    .await
+                    .expect("collect DirectPut bytes")
+                    .into_bytes()
+                    .to_vec(),
+            );
+        }
+        payloads.sort();
+        assert_eq!(
+            payloads,
+            [b"direct-adirect-b".to_vec(), b"direct-single".to_vec()]
+        );
+    })
+    .await
+    .expect("Firehose source-admission E2E timed out");
 }
 
 #[tokio::test]
