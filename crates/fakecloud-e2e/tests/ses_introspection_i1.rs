@@ -287,11 +287,34 @@ async fn ses_smtp_submissions_introspection_reflects_smtp_listener() {
 }
 
 #[tokio::test]
-#[ignore = "event-destination dispatch capture timing flaky in CI; unit tests cover state shape"]
 async fn ses_event_destination_deliveries_introspection_records_fanout() {
     let server = TestServer::start().await;
     let client = server.sesv2_client().await;
     let endpoint = server.endpoint();
+    server
+        .s3_client()
+        .await
+        .create_bucket()
+        .bucket("intro-ses-events")
+        .send()
+        .await
+        .unwrap();
+    let stream = server
+        .firehose_client()
+        .await
+        .create_delivery_stream()
+        .delivery_stream_name("intro-ses-events")
+        .extended_s3_destination_configuration(
+            aws_sdk_firehose::types::ExtendedS3DestinationConfiguration::builder()
+                .bucket_arn("arn:aws:s3:::intro-ses-events")
+                .role_arn("arn:aws:iam::123456789012:role/firehose")
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let stream_arn = stream.delivery_stream_arn().unwrap();
 
     // Verify identity.
     client
@@ -320,9 +343,7 @@ async fn ses_event_destination_deliveries_introspection_records_fanout() {
                 .kinesis_firehose_destination(
                     KinesisFirehoseDestination::builder()
                         .iam_role_arn("arn:aws:iam::123456789012:role/firehose")
-                        .delivery_stream_arn(
-                            "arn:aws:firehose:us-east-1:123456789012:deliverystream/ds1",
-                        )
+                        .delivery_stream_arn(stream_arn)
                         .build()
                         .expect("kf"),
                 )
@@ -334,7 +355,7 @@ async fn ses_event_destination_deliveries_introspection_records_fanout() {
 
     // Send an email pinned to the config set; success simulator yields
     // SEND + DELIVERY events.
-    client
+    let sent = client
         .send_email()
         .from_email_address("from@example.com")
         .destination(
@@ -362,16 +383,27 @@ async fn ses_event_destination_deliveries_introspection_records_fanout() {
         .expect("send email");
 
     let http = reqwest::Client::new();
-    let intro: Value = http
-        .get(format!(
-            "{endpoint}/_fakecloud/ses/event-destinations/deliveries"
-        ))
-        .send()
-        .await
-        .expect("get deliveries")
-        .json()
-        .await
-        .expect("json");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let intro: Value = loop {
+        let intro: Value = http
+            .get(format!(
+                "{endpoint}/_fakecloud/ses/event-destinations/deliveries"
+            ))
+            .send()
+            .await
+            .expect("get deliveries")
+            .json()
+            .await
+            .expect("json");
+        if intro["deliveries"].as_array().is_some_and(|d| d.len() >= 2) {
+            break intro;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected SEND+DELIVERY dispatches: {intro}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     let deliveries = intro["deliveries"].as_array().expect("deliveries array");
     assert!(
         deliveries.len() >= 2,
@@ -386,9 +418,7 @@ async fn ses_event_destination_deliveries_introspection_records_fanout() {
     for d in deliveries {
         assert_eq!(d["destinationName"], "fh");
         assert_eq!(d["destinationType"], "firehose");
-        assert_eq!(
-            d["targetArn"],
-            "arn:aws:firehose:us-east-1:123456789012:deliverystream/ds1"
-        );
+        assert_eq!(d["targetArn"], stream_arn);
+        assert_eq!(d["messageId"], sent.message_id().unwrap());
     }
 }

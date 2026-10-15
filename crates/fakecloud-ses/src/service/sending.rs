@@ -8,19 +8,6 @@ use crate::state::SentEmail;
 
 use super::{extract_string_array, SesV2Service};
 
-/// Extract bare email address from a "From" header. Strips display-name
-/// wrappers like `Foo <foo@example.com>` and surrounding whitespace.
-fn extract_email_address(from: &str) -> &str {
-    if let Some(start) = from.rfind('<') {
-        if let Some(end) = from.rfind('>') {
-            if end > start {
-                return from[start + 1..end].trim();
-            }
-        }
-    }
-    from.trim()
-}
-
 /// Real SES treats every address on the mailbox simulator domain as
 /// implicitly verified, both for senders and (in sandbox accounts) for
 /// recipients. The well-known mailboxes are
@@ -31,7 +18,7 @@ fn extract_email_address(from: &str) -> &str {
 /// the whole domain instead of hard-coding a list — AWS docs explicitly
 /// say the domain itself bypasses the verification gate.
 pub(super) fn is_simulator_address(email: &str) -> bool {
-    matches!(email.split_once('@'), Some((_, "simulator.amazonses.com")))
+    matches!(email.rsplit_once('@'), Some((_, "simulator.amazonses.com")))
 }
 
 /// Parse a SESv2 message-tag list (`[{Name, Value}]`) into name/value pairs.
@@ -67,7 +54,7 @@ pub(super) fn identity_is_verified(state: &crate::state::SesState, email: &str) 
     {
         return true;
     }
-    if let Some((_, domain)) = email.split_once('@') {
+    if let Some((_, domain)) = email.rsplit_once('@') {
         if !domain.is_empty()
             && state
                 .identities
@@ -162,8 +149,8 @@ impl SesV2Service {
         let Some(state) = accounts.get(account_id) else {
             return false;
         };
-        let bare = extract_email_address(address);
-        state.suppressed_match(bare, config_set_name).is_some()
+        crate::mime::mailbox_address(address)
+            .is_some_and(|bare| state.suppressed_match(&bare, config_set_name).is_some())
     }
 
     /// Increment the suppression-drop counter on the account state.
@@ -187,19 +174,18 @@ impl SesV2Service {
         account_id: &str,
         from: &str,
     ) -> Option<AwsResponse> {
-        let email = extract_email_address(from);
-        if email.is_empty() {
+        let Some(email) = crate::mime::mailbox_address(from) else {
             return Some(Self::json_error(
                 StatusCode::BAD_REQUEST,
                 "BadRequestException",
-                "FromEmailAddress is required",
+                "FromEmailAddress must be a single valid mailbox",
             ));
-        }
+        };
 
         let accounts = self.state.read();
         let verified = accounts
             .get(account_id)
-            .map(|st| identity_is_verified(st, email))
+            .map(|st| identity_is_verified(st, &email))
             .unwrap_or(false);
 
         if verified {
@@ -223,19 +209,25 @@ impl SesV2Service {
         account_id: &str,
         recipients: &[&str],
     ) -> Option<AwsResponse> {
+        let recipients = match crate::mime::api_recipients(recipients.iter().copied()) {
+            Ok(addresses) => addresses,
+            Err(_) => {
+                return Some(Self::json_error(
+                    StatusCode::BAD_REQUEST,
+                    "BadRequestException",
+                    "Recipients must contain at least one valid single mailbox",
+                ))
+            }
+        };
         let accounts = self.state.read();
         let state = accounts.get(account_id)?;
         if state.account_settings.production_access_enabled {
             return None;
         }
         let mut failing: Vec<String> = Vec::new();
-        for raw in recipients {
-            let addr = extract_email_address(raw);
-            if addr.is_empty() {
-                continue;
-            }
-            if !identity_is_verified(state, addr) {
-                failing.push(addr.to_string());
+        for addr in recipients {
+            if !identity_is_verified(state, &addr) {
+                failing.push(addr);
             }
         }
         if failing.is_empty() {
@@ -267,8 +259,40 @@ impl SesV2Service {
             ));
         }
 
-        let from = body["FromEmailAddress"].as_str().unwrap_or("").to_string();
-        let config_set_name = body["ConfigurationSetName"].as_str().map(|s| s.to_string());
+        let raw_mail =
+            if !body["Content"]["Simple"].is_object() && body["Content"]["Raw"].is_object() {
+                let Some(data) = body["Content"]["Raw"]["Data"].as_str() else {
+                    return Ok(Self::json_error(
+                        StatusCode::BAD_REQUEST,
+                        "BadRequestException",
+                        "Raw.Data is required",
+                    ));
+                };
+                match crate::mime::RawMail::parse(data) {
+                    Ok(raw) => Some(raw),
+                    Err(_) => {
+                        return Ok(Self::json_error(
+                            StatusCode::BAD_REQUEST,
+                            "BadRequestException",
+                            "Raw.Data must be base64 encoded",
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+        let from = body["FromEmailAddress"]
+            .as_str()
+            .or_else(|| raw_mail.as_ref().and_then(|raw| raw.header("From")))
+            .unwrap_or("")
+            .to_string();
+        let explicit_config = body["ConfigurationSetName"].as_str().or_else(|| {
+            raw_mail
+                .as_ref()
+                .and_then(|raw| raw.header("X-SES-CONFIGURATION-SET"))
+        });
+        let config_set_name =
+            crate::fanout::resolve_config_set(&self.state, &req.account_id, explicit_config, &from);
         if let Some(err) = self.check_sending_enabled(&req.account_id, config_set_name.as_deref()) {
             return Ok(err);
         }
@@ -276,9 +300,32 @@ impl SesV2Service {
             return Ok(err);
         }
 
-        let to = extract_string_array(&body["Destination"]["ToAddresses"]);
-        let cc = extract_string_array(&body["Destination"]["CcAddresses"]);
-        let bcc = extract_string_array(&body["Destination"]["BccAddresses"]);
+        let (to, cc, bcc) = if body.get("Destination").is_none_or(Value::is_null) {
+            if let Some(raw) = &raw_mail {
+                match (
+                    raw.addresses("To"),
+                    raw.addresses("Cc"),
+                    raw.addresses("Bcc"),
+                ) {
+                    (Ok(to), Ok(cc), Ok(bcc)) => (to, cc, bcc),
+                    _ => {
+                        return Ok(Self::json_error(
+                            StatusCode::BAD_REQUEST,
+                            "BadRequestException",
+                            "Invalid raw recipient field",
+                        ))
+                    }
+                }
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            }
+        } else {
+            (
+                extract_string_array(&body["Destination"]["ToAddresses"]),
+                extract_string_array(&body["Destination"]["CcAddresses"]),
+                extract_string_array(&body["Destination"]["BccAddresses"]),
+            )
+        };
 
         let recipients: Vec<&str> = to
             .iter()
@@ -296,8 +343,7 @@ impl SesV2Service {
         // address was suppressed for `COMPLAINT` but the config set only
         // enforces `BOUNCE`, the send proceeds.
         for r in &recipients {
-            let addr = extract_email_address(r);
-            if self.address_is_suppressed(&req.account_id, addr, config_set_name.as_deref()) {
+            if self.address_is_suppressed(&req.account_id, r, config_set_name.as_deref()) {
                 self.bump_suppression_drop(&req.account_id);
                 return Ok(Self::json_error(
                     StatusCode::BAD_REQUEST,
@@ -364,18 +410,14 @@ impl SesV2Service {
                 (None, None, None, None, None, None)
             };
 
-        let email_tags = body["EmailTags"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| {
-                        let name = t["Name"].as_str()?;
-                        let value = t["Value"].as_str()?;
-                        Some((name.to_string(), value.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let email_tags = if body["EmailTags"].is_array() {
+            parse_message_tags(&body["EmailTags"])
+        } else {
+            raw_mail
+                .as_ref()
+                .map(|raw| raw.message_tags())
+                .unwrap_or_default()
+        };
 
         let message_id = uuid::Uuid::new_v4().to_string();
 
@@ -461,7 +503,12 @@ impl SesV2Service {
         if let Some(err) = self.reject_unverified_sender(&req.account_id, &from) {
             return Ok(err);
         }
-        let config_set_name = body["ConfigurationSetName"].as_str().map(|s| s.to_string());
+        let config_set_name = crate::fanout::resolve_config_set(
+            &self.state,
+            &req.account_id,
+            body["ConfigurationSetName"].as_str(),
+            &from,
+        );
         if let Some(err) = self.check_sending_enabled(&req.account_id, config_set_name.as_deref()) {
             return Ok(err);
         }
@@ -512,6 +559,10 @@ impl SesV2Service {
                 .chain(bcc.iter())
                 .map(|s| s.as_str())
                 .collect();
+            if crate::mime::api_recipients(recipients.iter().copied()).is_err() {
+                results.push(json!({"Status":"INVALID_PARAMETER_VALUE", "Error":"Recipients must contain at least one valid single mailbox"}));
+                continue;
+            }
             if self
                 .reject_unverified_recipients(&req.account_id, &recipients)
                 .is_some()
@@ -530,8 +581,7 @@ impl SesV2Service {
             // Honors the effective `SuppressedReasons` filter so callers
             // can scope suppression to BOUNCE-only or COMPLAINT-only.
             let any_suppressed = recipients.iter().any(|r| {
-                let addr = extract_email_address(r);
-                self.address_is_suppressed(&req.account_id, addr, config_set_name.as_deref())
+                self.address_is_suppressed(&req.account_id, r, config_set_name.as_deref())
             });
             if any_suppressed {
                 self.bump_suppression_drop(&req.account_id);

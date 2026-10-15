@@ -428,7 +428,11 @@ impl fakecloud_core::service::AwsService for SesV2Service {
         // Route v1 Query protocol requests to the v1 module.
         if req.is_query_protocol {
             let mutates = is_mutating_action(req.action.as_str());
-            let result = crate::v1::handle_v1_action(&self.state, &req);
+            let result = crate::v1::handle_v1_action_with_delivery(
+                &self.state,
+                &req,
+                self.delivery_ctx.as_ref(),
+            );
             if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
                 self.save_snapshot().await;
             }

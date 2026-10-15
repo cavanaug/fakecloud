@@ -6899,6 +6899,7 @@ dependencies = [
  "fakecloud-persistence",
  "form_urlencoded",
  "http 1.4.0",
+ "mail-parser",
  "parking_lot",
  "percent-encoding",
  "quick-xml",

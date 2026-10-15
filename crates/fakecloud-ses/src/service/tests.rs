@@ -74,6 +74,1207 @@ fn make_request(method: Method, path: &str, body: &str) -> AwsRequest {
     make_request_with_query(method, path, body, "", HashMap::new())
 }
 
+struct SendEventRecorder {
+    state: SharedSesState,
+    records: std::sync::Mutex<Vec<(String, Value)>>,
+}
+
+impl fakecloud_core::delivery::FirehoseDelivery for SendEventRecorder {
+    fn put_record(&self, arn: &str, data: &[u8]) {
+        assert!(
+            self.state.try_write().is_some(),
+            "SES lock held during callback"
+        );
+        self.records
+            .lock()
+            .unwrap()
+            .push((arn.to_string(), serde_json::from_slice(data).unwrap()));
+    }
+}
+
+fn event_service() -> (SesV2Service, Arc<SendEventRecorder>) {
+    let state = make_state();
+    seed_identity(&state, "example.com");
+    state.write().default_mut().templates.insert(
+        "tpl".into(),
+        crate::state::EmailTemplate {
+            template_name: "tpl".into(),
+            subject: Some("Hello {{name}}".into()),
+            html_body: None,
+            text_body: Some("Body {{name}}".into()),
+            created_at: chrono::Utc::now(),
+        },
+    );
+    let recorder = Arc::new(SendEventRecorder {
+        state: state.clone(),
+        records: Default::default(),
+    });
+    let svc = SesV2Service::new(state.clone()).with_delivery(SesDeliveryContext {
+        ses_state: state,
+        delivery_bus: Arc::new(
+            fakecloud_core::delivery::DeliveryBus::new().with_firehose(recorder.clone()),
+        ),
+    });
+    (svc, recorder)
+}
+
+fn query_request(action: &str, params: &[(&str, &str)]) -> AwsRequest {
+    let mut req = make_request(Method::POST, "/", "");
+    req.is_query_protocol = true;
+    req.action = action.to_string();
+    req.query_params = params
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    req
+}
+
+#[tokio::test]
+async fn optional_v2_raw_resolves_headers_before_admission_and_honors_api_precedence() {
+    for explicit_from in [false, true] {
+        for explicit_destination in [false, true] {
+            let (svc, recorder) = event_service();
+            create_v1_event_config(&svc, "header-cs").await;
+            create_v1_event_config(&svc, "api-cs").await;
+            svc.state
+                .write()
+                .default_mut()
+                .account_settings
+                .production_access_enabled = false;
+            let raw = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
+                "From: Header <header@example.com>\r\nTo: header-to@example.com\r\nCc: header-cc@example.com\r\nBcc: header-bcc@example.com\r\nX-SES-CONFIGURATION-SET: header-cs\r\nSubject: raw\r\n\r\nbody");
+            let mut body = json!({"Content":{"Raw":{"Data":raw}}});
+            if explicit_from {
+                body["FromEmailAddress"] = json!("API <api@example.com>");
+            }
+            if explicit_destination {
+                body["Destination"] = json!({"ToAddresses":["api-to@example.com"]});
+                body["ConfigurationSetName"] = json!("api-cs");
+            }
+            let response = svc
+                .handle(make_request(
+                    Method::POST,
+                    "/v2/email/outbound-emails",
+                    &body.to_string(),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                response.status.is_success(),
+                "{}",
+                std::str::from_utf8(response.body.expect_bytes()).unwrap()
+            );
+            let calls = recorder.records.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].1["mail"]["source"],
+                if explicit_from {
+                    "api@example.com"
+                } else {
+                    "header@example.com"
+                }
+            );
+            assert_eq!(
+                calls[0].1["mail"]["destination"],
+                if explicit_destination {
+                    json!(["api-to@example.com"])
+                } else {
+                    json!([
+                        "header-to@example.com",
+                        "header-cc@example.com",
+                        "header-bcc@example.com"
+                    ])
+                }
+            );
+            assert_eq!(
+                calls[0].1["mail"]["tags"]["ses:configuration-set"],
+                if explicit_destination {
+                    json!(["api-cs"])
+                } else {
+                    json!(["header-cs"])
+                }
+            );
+            let accounts = svc.state.read();
+            let sent = &accounts.default_ref().sent_emails[0];
+            assert_eq!(
+                sent.from,
+                if explicit_from {
+                    "API <api@example.com>"
+                } else {
+                    "Header <header@example.com>"
+                }
+            );
+            assert_eq!(sent.raw_data.as_deref(), Some(raw.as_str()));
+        }
+    }
+}
+
+#[tokio::test]
+async fn optional_v2_raw_missing_or_bad_effective_fields_do_not_record_or_publish() {
+    for text in [
+        "From: sender@example.com\r\n\r\nbody",
+        "To: to@example.com\r\n\r\nbody",
+        "From: sender@example.com\r\nTo: not-an-address\r\n\r\nbody",
+    ] {
+        let (svc, recorder) = event_service();
+        create_v1_event_config(&svc, "cs").await;
+        let raw = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text);
+        let body = json!({"ConfigurationSetName":"cs", "Content":{"Raw":{"Data":raw}}});
+        assert!(!svc
+            .handle(make_request(
+                Method::POST,
+                "/v2/email/outbound-emails",
+                &body.to_string()
+            ))
+            .await
+            .unwrap()
+            .status
+            .is_success());
+        assert!(recorder.records.lock().unwrap().is_empty());
+        assert!(svc.state.read().default_ref().sent_emails.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn optional_quoted_sender_uses_domain_default_configuration_and_dkim_identity() {
+    let (key, _) = crate::dkim::generate_easy_dkim_keypair();
+    for mode in ["v1", "v2", "v2-bulk"] {
+        let (svc, recorder) = event_service();
+        create_v1_event_config(&svc, "default-cs").await;
+        {
+            let mut accounts = svc.state.write();
+            let identity = accounts
+                .default_mut()
+                .identities
+                .get_mut("example.com")
+                .unwrap();
+            identity.configuration_set_name = Some("default-cs".into());
+            identity.dkim_domain_signing_private_key = Some(key.clone());
+        }
+        let from = r#""user@department"@example.com"#;
+        let request = if mode == "v1" {
+            query_request(
+                "SendEmail",
+                &[
+                    ("Source", from),
+                    ("Destination.ToAddresses.member.1", "to@example.com"),
+                ],
+            )
+        } else if mode == "v2" {
+            let body = json!({"FromEmailAddress":from,"Destination":{"ToAddresses":["to@example.com"]},
+                "Content":{"Simple":{"Subject":{"Data":"subject"},"Body":{"Text":{"Data":"body"}}}}});
+            make_request(Method::POST, "/v2/email/outbound-emails", &body.to_string())
+        } else {
+            let body = json!({"FromEmailAddress":from,"DefaultContent":{"Template":{"TemplateName":"tpl","TemplateData":"{}"}},
+                "BulkEmailEntries":[{"Destination":{"ToAddresses":["to@example.com"]}}]});
+            make_request(
+                Method::POST,
+                "/v2/email/outbound-bulk-emails",
+                &body.to_string(),
+            )
+        };
+        assert!(svc.handle(request).await.unwrap().status.is_success());
+        let calls = recorder.records.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{mode}");
+        assert_eq!(
+            calls[0].1["mail"]["tags"]["ses:configuration-set"],
+            json!(["default-cs"])
+        );
+        assert!(
+            svc.state.read().default_ref().sent_emails[0]
+                .dkim_signature
+                .is_some(),
+            "{mode}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn optional_raw_group_trailing_comments_are_not_missing_mailboxes() {
+    for v2 in [false, true] {
+        let (svc, recorder) = event_service();
+        create_v1_event_config(&svc, "cs").await;
+        svc.state
+            .write()
+            .default_mut()
+            .account_settings
+            .production_access_enabled = false;
+        let raw = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
+            "From: sender@example.com\r\nTo: Team: good@example.com; (team (nested))\r\nCc: Empty: (nobody); (end)\r\nX-SES-CONFIGURATION-SET: cs\r\n\r\nbody");
+        let request = if v2 {
+            let body = json!({"Content":{"Raw":{"Data":raw}}});
+            make_request(Method::POST, "/v2/email/outbound-emails", &body.to_string())
+        } else {
+            query_request("SendRawEmail", &[("RawMessage.Data", &raw)])
+        };
+        let response = svc.handle(request).await.unwrap();
+        assert!(response.status.is_success());
+        assert_eq!(
+            recorder.records.lock().unwrap()[0].1["mail"]["destination"],
+            json!(["good@example.com"])
+        );
+        let bad = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
+            "From: sender@example.com\r\nTo: good@example.com, not-an-address (label)\r\nX-SES-CONFIGURATION-SET: cs\r\n\r\nbody");
+        let request = if v2 {
+            let body = json!({"Content":{"Raw":{"Data":bad}}});
+            make_request(Method::POST, "/v2/email/outbound-emails", &body.to_string())
+        } else {
+            query_request("SendRawEmail", &[("RawMessage.Data", &bad)])
+        };
+        let result = svc.handle(request).await;
+        assert!(result.is_err() || !result.as_ref().unwrap().status.is_success());
+        assert_eq!(recorder.records.lock().unwrap().len(), 1);
+        assert_eq!(svc.state.read().default_ref().sent_emails.len(), 1);
+    }
+}
+
+#[test]
+fn optional_quoted_local_part_domain_helpers_use_last_at_sign() {
+    assert_eq!(
+        crate::fanout::infer_isp(r#""user@department"@gmail.com"#),
+        "Gmail"
+    );
+    assert!(super::sending::is_simulator_address(
+        r#""user@department"@simulator.amazonses.com"#
+    ));
+}
+
+#[tokio::test]
+async fn optional_default_configuration_pause_is_checked_before_dispatch() {
+    for bulk in [false, true] {
+        let (svc, recorder) = event_service();
+        create_v1_event_config(&svc, "default-cs").await;
+        {
+            let mut accounts = svc.state.write();
+            let state = accounts.default_mut();
+            state
+                .identities
+                .get_mut("example.com")
+                .unwrap()
+                .configuration_set_name = Some("default-cs".into());
+            state
+                .configuration_sets
+                .get_mut("default-cs")
+                .unwrap()
+                .sending_enabled = false;
+        }
+        let body = if bulk {
+            json!({"FromEmailAddress":"sender@example.com", "DefaultContent":{"Template":{"TemplateName":"tpl","TemplateData":"{}"}},
+                "BulkEmailEntries":[{"Destination":{"ToAddresses":["to@example.com"]}}]})
+        } else {
+            json!({"FromEmailAddress":"sender@example.com","Destination":{"ToAddresses":["to@example.com"]},
+                "Content":{"Simple":{"Subject":{"Data":"subject"},"Body":{"Text":{"Data":"body"}}}}})
+        };
+        let path = if bulk {
+            "/v2/email/outbound-bulk-emails"
+        } else {
+            "/v2/email/outbound-emails"
+        };
+        let response = svc
+            .handle(make_request(Method::POST, path, &body.to_string()))
+            .await
+            .unwrap();
+        assert!(!response.status.is_success());
+        let result: Value = serde_json::from_slice(response.body.expect_bytes()).unwrap();
+        assert_eq!(result["__type"], "SendingPausedException");
+        assert!(recorder.records.lock().unwrap().is_empty());
+        assert!(svc.state.read().default_ref().sent_emails.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn admission_v2_single_rejects_group_members_before_verification() {
+    for production in [false, true] {
+        for address in [
+            "Team: Unverified <one@other.test>, Verified <two@example.com>;",
+            "Team: Verified <two@example.com>;",
+        ] {
+            let (svc, recorder) = event_service();
+            create_v1_event_config(&svc, "cs").await;
+            svc.state
+                .write()
+                .default_mut()
+                .account_settings
+                .production_access_enabled = production;
+            let body = json!({"FromEmailAddress":"sender@example.com", "ConfigurationSetName":"cs",
+                "Destination":{"ToAddresses":[address]}, "Content":{"Simple":{"Subject":{"Data":"subject"}, "Body":{"Text":{"Data":"body"}}}}});
+            let response = svc
+                .handle(make_request(
+                    Method::POST,
+                    "/v2/email/outbound-emails",
+                    &body.to_string(),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                !response.status.is_success(),
+                "API groups are not single mailboxes: {address}"
+            );
+            assert!(recorder.records.lock().unwrap().is_empty());
+            assert!(svc.state.read().default_ref().sent_emails.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn admission_v2_bulk_rejects_group_members_without_recording() {
+    for production in [false, true] {
+        let (svc, recorder) = event_service();
+        create_v1_event_config(&svc, "cs").await;
+        svc.state
+            .write()
+            .default_mut()
+            .account_settings
+            .production_access_enabled = production;
+        let body = json!({"FromEmailAddress":"sender@example.com", "ConfigurationSetName":"cs",
+            "DefaultContent":{"Template":{"TemplateName":"tpl","TemplateData":"{}"}},
+            "BulkEmailEntries":[{"Destination":{"ToAddresses":["Team: Unverified <one@other.test>, Verified <two@example.com>;"]}}]});
+        let response = svc
+            .handle(make_request(
+                Method::POST,
+                "/v2/email/outbound-bulk-emails",
+                &body.to_string(),
+            ))
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(response.body.expect_bytes()).unwrap();
+        assert_ne!(
+            result["BulkEmailEntryResults"][0]["Status"], "SUCCESS",
+            "{result}"
+        );
+        assert!(result["BulkEmailEntryResults"][0]["MessageId"].is_null());
+        assert!(recorder.records.lock().unwrap().is_empty());
+        assert!(svc.state.read().default_ref().sent_emails.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn admission_raw_rejects_invalid_entries_and_empty_effective_envelopes() {
+    for recipient_headers in [
+        "To: not-an-address\r\n",
+        "To: good@example.com, not-an-address\r\n",
+        "To: good@example.com\r\nCc: not-an-address\r\n",
+        "To: Empty:\r\nCc: good@example.com\r\n",
+        "To: Empty:;\r\n",
+        "",
+    ] {
+        let (svc, recorder) = event_service();
+        create_v1_event_config(&svc, "cs").await;
+        svc.state
+            .write()
+            .default_mut()
+            .account_settings
+            .production_access_enabled = false;
+        let raw = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
+            format!("From: sender@example.com\r\n{recipient_headers}X-SES-CONFIGURATION-SET: cs\r\n\r\nbody"));
+        let result = svc
+            .handle(query_request("SendRawEmail", &[("RawMessage.Data", &raw)]))
+            .await;
+        assert!(
+            result.is_err(),
+            "must reject malformed/empty envelope: {recipient_headers:?}"
+        );
+        assert!(recorder.records.lock().unwrap().is_empty());
+        assert!(svc.state.read().default_ref().sent_emails.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn admission_raw_empty_group_with_valid_recipient_is_accepted() {
+    let (svc, recorder) = event_service();
+    create_v1_event_config(&svc, "cs").await;
+    svc.state
+        .write()
+        .default_mut()
+        .account_settings
+        .production_access_enabled = false;
+    let raw = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
+        "From: sender@example.com\r\nTo: Empty:;\r\nCc: Good <good@example.com>\r\nX-SES-CONFIGURATION-SET: cs\r\n\r\nbody");
+    assert!(svc
+        .handle(query_request("SendRawEmail", &[("RawMessage.Data", &raw)]))
+        .await
+        .unwrap()
+        .status
+        .is_success());
+    assert_eq!(
+        recorder.records.lock().unwrap()[0].1["mail"]["destination"],
+        json!(["good@example.com"])
+    );
+}
+
+#[tokio::test]
+async fn admission_quoted_local_parts_survive_api_and_raw_sends() {
+    for address in [r#""a,b"@example.com"#, r#"Recipient <"a,b"@example.com>"#] {
+        for mode in [
+            "v1-api",
+            "v1-raw-headers",
+            "v1-raw-api",
+            "v1-template",
+            "v1-bulk",
+            "v2-api",
+            "v2-bulk",
+        ] {
+            let (svc, recorder) = event_service();
+            create_v1_event_config(&svc, "cs").await;
+            svc.state
+                .write()
+                .default_mut()
+                .account_settings
+                .production_access_enabled = false;
+            let request = if mode.starts_with("v1-raw") {
+                let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
+                    format!("From: {address}\r\nTo: {address}\r\nX-SES-CONFIGURATION-SET: cs\r\n\r\nbody"));
+                let mut request = query_request("SendRawEmail", &[("RawMessage.Data", &encoded)]);
+                if mode == "v1-raw-api" {
+                    request.query_params.insert("Source".into(), address.into());
+                    request
+                        .query_params
+                        .insert("Destinations.member.1".into(), address.into());
+                }
+                request
+            } else if mode.starts_with("v1-") {
+                let action = match mode {
+                    "v1-template" => "SendTemplatedEmail",
+                    "v1-bulk" => "SendBulkTemplatedEmail",
+                    _ => "SendEmail",
+                };
+                query_request(
+                    action,
+                    &[
+                        ("Source", address),
+                        ("ConfigurationSetName", "cs"),
+                        ("Destination.ToAddresses.member.1", address),
+                        ("Template", "tpl"),
+                        ("TemplateData", "{}"),
+                        (
+                            "Destinations.member.1.Destination.ToAddresses.member.1",
+                            address,
+                        ),
+                    ],
+                )
+            } else if mode == "v2-api" {
+                let body = json!({"FromEmailAddress":address,"ConfigurationSetName":"cs", "Destination":{"ToAddresses":[address]},
+                    "Content":{"Simple":{"Subject":{"Data":"subject"},"Body":{"Text":{"Data":"body"}}}}});
+                make_request(Method::POST, "/v2/email/outbound-emails", &body.to_string())
+            } else {
+                let body = json!({"FromEmailAddress":address,"ConfigurationSetName":"cs", "DefaultContent":{"Template":{"TemplateName":"tpl","TemplateData":"{}"}},
+                    "BulkEmailEntries":[{"Destination":{"ToAddresses":[address]}}]});
+                make_request(
+                    Method::POST,
+                    "/v2/email/outbound-bulk-emails",
+                    &body.to_string(),
+                )
+            };
+            assert!(
+                svc.handle(request).await.unwrap().status.is_success(),
+                "{mode}"
+            );
+            let calls = recorder.records.lock().unwrap();
+            assert_eq!(calls.len(), 1, "{mode}");
+            assert_eq!(calls[0].1["mail"]["source"], r#""a,b"@example.com"#);
+            assert_eq!(
+                calls[0].1["mail"]["destination"],
+                json!([r#""a,b"@example.com"#])
+            );
+            let accounts = svc.state.read();
+            let sent = &accounts.default_ref().sent_emails[0];
+            assert_eq!(sent.from, address);
+            assert_eq!(
+                sent.to,
+                [if mode == "v1-raw-headers" {
+                    r#""a,b"@example.com"#
+                } else {
+                    address
+                }],
+                "{mode}"
+            );
+            assert_eq!(
+                sent.delivery_insights[0].destination,
+                r#""a,b"@example.com"#
+            );
+        }
+    }
+}
+
+async fn create_v1_event_config(svc: &SesV2Service, name: &str) {
+    svc.handle(query_request(
+        "CreateConfigurationSet",
+        &[("ConfigurationSet.Name", name)],
+    ))
+    .await
+    .unwrap();
+    svc.handle(query_request(
+        "CreateConfigurationSetEventDestination",
+        &[
+            ("ConfigurationSetName", name),
+            ("EventDestination.Name", "fh"),
+            ("EventDestination.Enabled", "true"),
+            ("EventDestination.MatchingEventTypes.member.1", "send"),
+            ("EventDestination.MatchingEventTypes.member.2", "bounce"),
+            (
+                "EventDestination.KinesisFirehoseDestination.DeliveryStreamARN",
+                "arn:aws:firehose:us-east-1:123456789012:deliverystream/events",
+            ),
+            (
+                "EventDestination.KinesisFirehoseDestination.IAMRoleARN",
+                "arn:aws:iam::123456789012:role/events",
+            ),
+        ],
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn v1_send_dispatch_publishes_each_successful_message_and_preserves_envelope() {
+    let (svc, recorder) = event_service();
+    create_v1_event_config(&svc, "cs").await;
+    for action in [
+        "SendEmail",
+        "SendRawEmail",
+        "SendTemplatedEmail",
+        "SendBulkTemplatedEmail",
+    ] {
+        let raw = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "From: sender@example.com\r\nTo: header@example.com\r\n\r\nbody",
+        );
+        let req = query_request(
+            action,
+            &[
+                ("Source", "sender@example.com"),
+                ("ConfigurationSetName", "cs"),
+                ("Destination.ToAddresses.member.1", "to@example.com"),
+                ("Destination.CcAddresses.member.1", "cc@example.com"),
+                ("Destination.BccAddresses.member.1", "bcc@example.com"),
+                ("Destinations.member.1", "to@example.com"),
+                ("RawMessage.Data", &raw),
+                ("Template", "tpl"),
+                ("TemplateData", r#"{"name":"Ada"}"#),
+                ("DefaultTemplateData", r#"{"name":"Ada"}"#),
+                (
+                    "Destinations.member.1.Destination.ToAddresses.member.1",
+                    "to@example.com",
+                ),
+                (
+                    "Destinations.member.1.Destination.CcAddresses.member.1",
+                    "cc@example.com",
+                ),
+                (
+                    "Destinations.member.1.Destination.BccAddresses.member.1",
+                    "bcc@example.com",
+                ),
+                ("Tags.member.1.Name", "campaign"),
+                ("Tags.member.1.Value", "fall"),
+                ("DefaultTags.member.1.Name", "campaign"),
+                ("DefaultTags.member.1.Value", "fall"),
+            ],
+        );
+        let resp = svc.handle(req).await.unwrap();
+        assert!(resp.status.is_success(), "{action}");
+        let xml = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+        let id = xml
+            .split("<MessageId>")
+            .nth(1)
+            .unwrap()
+            .split("</MessageId>")
+            .next()
+            .unwrap();
+        let calls = recorder.records.lock().unwrap();
+        let (_, event) = calls.last().expect("successful send must publish an event");
+        assert_eq!(event["mail"]["messageId"], id, "{action}");
+        assert_eq!(event["mail"]["source"], "sender@example.com");
+        let want = if action == "SendRawEmail" {
+            json!(["to@example.com"])
+        } else {
+            json!(["to@example.com", "cc@example.com", "bcc@example.com"])
+        };
+        assert_eq!(event["mail"]["destination"], want, "{action}");
+        assert_eq!(event["mail"]["tags"]["campaign"], json!(["fall"]));
+        drop(calls);
+        let accounts = svc.state.read();
+        let sent = accounts.default_ref().sent_emails.last().unwrap();
+        assert_eq!(sent.message_id, id);
+        assert!(!sent.delivery_insights.is_empty());
+        if action.contains("Templated") {
+            assert_eq!(sent.subject.as_deref(), Some("Hello Ada"));
+        }
+    }
+    assert_eq!(recorder.records.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn v1_raw_send_uses_unfolded_headers_and_explicit_arguments_take_precedence() {
+    let (svc, recorder) = event_service();
+    create_v1_event_config(&svc, "header-cs").await;
+    create_v1_event_config(&svc, "explicit-cs").await;
+    let raw = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
+        "From: Sender <sender@example.com>\r\nTo: \"Recipient, One\" <to@example.com>\r\nCc: cc@example.com\r\nBcc: bcc@example.com\r\nx-ses-configuration-set:\r\n\theader-cs\r\nX-SES-MESSAGE-TAGS: campaign=header, team=ses\r\nSubject: raw\r\n\r\nX-SES-CONFIGURATION-SET: body-is-not-a-header");
+    for explicit in [false, true] {
+        let mut req = query_request("SendRawEmail", &[("RawMessage.Data", &raw)]);
+        if explicit {
+            for (k, v) in [
+                ("ConfigurationSetName", "explicit-cs"),
+                ("Source", "override@example.com"),
+                ("Destinations.member.1", "override-to@example.com"),
+                ("Tags.member.1.Name", "campaign"),
+                ("Tags.member.1.Value", "api"),
+            ] {
+                req.query_params.insert(k.into(), v.into());
+            }
+        }
+        let resp = svc.handle(req).await.unwrap();
+        assert!(resp.status.is_success());
+        let calls = recorder.records.lock().unwrap();
+        assert_eq!(calls.len(), if explicit { 2 } else { 1 });
+        let event = &calls.last().unwrap().1;
+        assert_eq!(
+            event["mail"]["tags"]["campaign"],
+            if explicit {
+                json!(["api"])
+            } else {
+                json!(["header"])
+            }
+        );
+        assert_eq!(
+            event["mail"]["tags"]["team"],
+            if explicit {
+                Value::Null
+            } else {
+                json!(["ses"])
+            }
+        );
+        assert_eq!(
+            event["mail"]["tags"]["ses:configuration-set"],
+            if explicit {
+                json!(["explicit-cs"])
+            } else {
+                json!(["header-cs"])
+            }
+        );
+        assert_eq!(
+            event["mail"]["source"],
+            if explicit {
+                "override@example.com"
+            } else {
+                "sender@example.com"
+            }
+        );
+        assert_eq!(
+            event["mail"]["destination"],
+            if explicit {
+                json!(["override-to@example.com"])
+            } else {
+                json!(["to@example.com", "cc@example.com", "bcc@example.com"])
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn v1_failed_sends_and_bulk_entries_do_not_publish() {
+    let (svc, recorder) = event_service();
+    create_v1_event_config(&svc, "cs").await;
+    let req = query_request(
+        "SendEmail",
+        &[
+            ("Source", "unverified@other.test"),
+            ("ConfigurationSetName", "cs"),
+            ("Destination.ToAddresses.member.1", "to@example.com"),
+        ],
+    );
+    assert!(svc.handle(req).await.is_err());
+    svc.state
+        .write()
+        .default_mut()
+        .account_settings
+        .sending_enabled = false;
+    let req = query_request(
+        "SendEmail",
+        &[
+            ("Source", "sender@example.com"),
+            ("ConfigurationSetName", "cs"),
+            ("Destination.ToAddresses.member.1", "to@example.com"),
+        ],
+    );
+    assert!(svc.handle(req).await.is_err());
+    svc.state
+        .write()
+        .default_mut()
+        .account_settings
+        .sending_enabled = true;
+    svc.state
+        .write()
+        .default_mut()
+        .suppressed_destinations
+        .insert(
+            "blocked@example.com".into(),
+            crate::state::SuppressedDestination {
+                email_address: "blocked@example.com".into(),
+                reason: "BOUNCE".into(),
+                last_update_time: chrono::Utc::now(),
+            },
+        );
+    let raw = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
+        "From: sender@example.com\r\nTo: blocked@example.com\r\nX-SES-CONFIGURATION-SET: cs\r\n\r\nbody");
+    assert!(svc
+        .handle(query_request("SendRawEmail", &[("RawMessage.Data", &raw)]))
+        .await
+        .is_err());
+    assert!(recorder.records.lock().unwrap().is_empty());
+    let req = query_request(
+        "SendTemplatedEmail",
+        &[
+            ("Source", "sender@example.com"),
+            ("ConfigurationSetName", "cs"),
+            ("Template", "missing"),
+            ("TemplateData", "{}"),
+        ],
+    );
+    assert!(svc.handle(req).await.is_err());
+    svc.state
+        .write()
+        .default_mut()
+        .account_settings
+        .production_access_enabled = false;
+    let req = query_request(
+        "SendBulkTemplatedEmail",
+        &[
+            ("Source", "sender@example.com"),
+            ("ConfigurationSetName", "cs"),
+            ("Template", "tpl"),
+            (
+                "Destinations.member.1.Destination.ToAddresses.member.1",
+                "unverified@other.test",
+            ),
+            (
+                "Destinations.member.2.Destination.ToAddresses.member.1",
+                "bounce@simulator.amazonses.com",
+            ),
+        ],
+    );
+    let resp = svc.handle(req).await.unwrap();
+    let xml = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+    assert!(xml.contains("<Status>MessageRejected</Status>"));
+    assert!(xml.contains("<Status>Success</Status>"));
+    let calls = recorder.records.lock().unwrap();
+    assert_eq!(calls.len(), 2, "only successful entry emits Send + Bounce");
+    assert_eq!(calls[0].1["eventType"], "Send");
+    assert_eq!(calls[1].1["eventType"], "Bounce");
+}
+
+#[tokio::test]
+async fn v1_send_fanout_uses_request_account_and_region() {
+    let (svc, recorder) = event_service();
+    create_v1_event_config(&svc, "cs").await;
+    let account = "111111111111";
+    let region = "eu-west-1";
+    for mut req in [
+        query_request("VerifyDomainIdentity", &[("Domain", "other.test")]),
+        query_request("CreateConfigurationSet", &[("ConfigurationSet.Name", "cs")]),
+        query_request(
+            "CreateConfigurationSetEventDestination",
+            &[
+                ("ConfigurationSetName", "cs"),
+                ("EventDestination.Name", "other-fh"),
+                ("EventDestination.Enabled", "true"),
+                ("EventDestination.MatchingEventTypes.member.1", "send"),
+                (
+                    "EventDestination.KinesisFirehoseDestination.DeliveryStreamARN",
+                    "arn:aws:firehose:eu-west-1:111111111111:deliverystream/events",
+                ),
+                (
+                    "EventDestination.KinesisFirehoseDestination.IAMRoleARN",
+                    "arn:aws:iam::111111111111:role/events",
+                ),
+            ],
+        ),
+        query_request(
+            "SendEmail",
+            &[
+                ("Source", "sender@other.test"),
+                ("ConfigurationSetName", "cs"),
+                ("Destination.ToAddresses.member.1", "to@other.test"),
+            ],
+        ),
+    ] {
+        req.account_id = account.into();
+        req.region = region.into();
+        assert!(svc.handle(req).await.unwrap().status.is_success());
+    }
+    let calls = recorder.records.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].0,
+        "arn:aws:firehose:eu-west-1:111111111111:deliverystream/events"
+    );
+    assert_eq!(calls[0].1["mail"]["sendingAccountId"], account);
+    assert_eq!(
+        calls[0].1["mail"]["sourceArn"],
+        "arn:aws:ses:eu-west-1:111111111111:identity/other.test"
+    );
+    assert!(svc
+        .state
+        .read()
+        .default_ref()
+        .event_destination_dispatches
+        .is_empty());
+    assert!(svc.state.read().default_ref().sent_emails.is_empty());
+}
+
+#[tokio::test]
+async fn v1_identity_default_configuration_and_cc_bounce_are_published() {
+    let (svc, recorder) = event_service();
+    create_v1_event_config(&svc, "default-cs").await;
+    svc.state
+        .write()
+        .default_mut()
+        .event_destinations
+        .get_mut("default-cs")
+        .unwrap()[0]
+        .matching_event_types
+        .push("delivery".into());
+    svc.state
+        .write()
+        .default_mut()
+        .identities
+        .get_mut("example.com")
+        .unwrap()
+        .configuration_set_name = Some("default-cs".into());
+    let resp = svc
+        .handle(query_request(
+            "SendEmail",
+            &[
+                ("Source", "Sender <sender@example.com>"),
+                ("Destination.ToAddresses.member.1", "to@example.com"),
+                (
+                    "Destination.CcAddresses.member.1",
+                    "bounce@simulator.amazonses.com",
+                ),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status.is_success());
+    let calls = recorder.records.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        3,
+        "Send once, normal To delivered, simulator Cc bounced"
+    );
+    let delivery = &calls
+        .iter()
+        .find(|c| c.1["eventType"] == "Delivery")
+        .unwrap()
+        .1;
+    let bounce = &calls
+        .iter()
+        .find(|c| c.1["eventType"] == "Bounce")
+        .unwrap()
+        .1;
+    assert_eq!(
+        bounce["bounce"]["bouncedRecipients"][0]["emailAddress"],
+        "bounce@simulator.amazonses.com"
+    );
+    assert_eq!(
+        bounce["bounce"]["bouncedRecipients"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        delivery["delivery"]["recipients"],
+        json!(["to@example.com"])
+    );
+    assert_eq!(
+        calls[1].1["mail"]["tags"]["ses:configuration-set"],
+        json!(["default-cs"])
+    );
+}
+
+#[tokio::test]
+async fn review_mixed_simulator_outcomes_partition_details_and_insights() {
+    let (svc, recorder) = event_service();
+    create_v1_event_config(&svc, "cs").await;
+    svc.state
+        .write()
+        .default_mut()
+        .event_destinations
+        .get_mut("cs")
+        .unwrap()[0]
+        .matching_event_types = ["send", "delivery", "bounce", "complaint"]
+        .map(str::to_string)
+        .to_vec();
+    let response = svc
+        .handle(query_request(
+            "SendEmail",
+            &[
+                ("Source", "sender@example.com"),
+                ("ConfigurationSetName", "cs"),
+                ("Destination.ToAddresses.member.1", "normal@example.com"),
+                (
+                    "Destination.CcAddresses.member.1",
+                    "bounce@simulator.amazonses.com",
+                ),
+                (
+                    "Destination.BccAddresses.member.1",
+                    "complaint@simulator.amazonses.com",
+                ),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert!(response.status.is_success());
+    let calls = recorder.records.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        4,
+        "one Send plus each distinct followup outcome"
+    );
+    let event = |kind: &str| &calls.iter().find(|c| c.1["eventType"] == kind).unwrap().1;
+    assert_eq!(
+        calls.iter().filter(|c| c.1["eventType"] == "Send").count(),
+        1
+    );
+    assert_eq!(
+        event("Delivery")["delivery"]["recipients"],
+        json!(["normal@example.com", "complaint@simulator.amazonses.com"])
+    );
+    let bounced = event("Bounce")["bounce"]["bouncedRecipients"]
+        .as_array()
+        .unwrap();
+    assert_eq!(bounced.len(), 1);
+    assert_eq!(bounced[0]["emailAddress"], "bounce@simulator.amazonses.com");
+    assert_eq!(
+        event("Complaint")["complaint"]["complainedRecipients"],
+        json!([{"emailAddress":"complaint@simulator.amazonses.com"}])
+    );
+    for (_, event) in calls.iter() {
+        assert_eq!(
+            event["mail"]["destination"],
+            json!([
+                "normal@example.com",
+                "bounce@simulator.amazonses.com",
+                "complaint@simulator.amazonses.com"
+            ])
+        );
+    }
+    let accounts = svc.state.read();
+    let insights = &accounts.default_ref().sent_emails[0].delivery_insights;
+    for (address, expected) in [
+        ("normal@example.com", vec!["SEND", "DELIVERY"]),
+        ("bounce@simulator.amazonses.com", vec!["SEND", "BOUNCE"]),
+        (
+            "complaint@simulator.amazonses.com",
+            vec!["SEND", "DELIVERY", "COMPLAINT"],
+        ),
+    ] {
+        let insight = insights.iter().find(|i| i.destination == address).unwrap();
+        assert_eq!(
+            insight
+                .events
+                .iter()
+                .map(|e| e.event_type.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn review_raw_comments_groups_quoted_commas_and_header_from_work_in_sandbox() {
+    let (svc, recorder) = event_service();
+    create_v1_event_config(&svc, "cs").await;
+    svc.state
+        .write()
+        .default_mut()
+        .account_settings
+        .production_access_enabled = false;
+    for from in [
+        "sender@example.com (Sender)",
+        "\"Sender, One\" <sender@example.com>",
+    ] {
+        let text = format!("From: {from}\r\nTo: to@example.com (Recipient), Team: one@example.com, two@example.com;\r\nCc: \"Recipient, Three\" <three@example.com>\r\nX-SES-CONFIGURATION-SET: cs\r\n\r\nTo: body@other.test");
+        let raw = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &text);
+        let resp = svc
+            .handle(query_request("SendRawEmail", &[("RawMessage.Data", &raw)]))
+            .await
+            .unwrap();
+        assert!(resp.status.is_success());
+        let calls = recorder.records.lock().unwrap();
+        let event = &calls.last().unwrap().1;
+        assert_eq!(event["mail"]["source"], "sender@example.com");
+        assert_eq!(
+            event["mail"]["destination"],
+            json!([
+                "to@example.com",
+                "one@example.com",
+                "two@example.com",
+                "three@example.com"
+            ])
+        );
+        let accounts = svc.state.read();
+        let email = accounts.default_ref().sent_emails.last().unwrap();
+        assert_eq!(email.from, from, "display-name header storage is preserved");
+        assert_eq!(email.raw_data.as_deref(), Some(raw.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn review_api_display_names_are_bare_in_events_but_preserved_in_storage() {
+    for action in [
+        "SendEmail",
+        "SendRawEmail",
+        "SendTemplatedEmail",
+        "SendBulkTemplatedEmail",
+    ] {
+        let (svc, recorder) = event_service();
+        create_v1_event_config(&svc, "cs").await;
+        let raw = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "From: sender@example.com\r\nTo: ignored@example.com\r\n\r\nbody",
+        );
+        let resp = svc
+            .handle(query_request(
+                action,
+                &[
+                    ("Source", "Sender <sender@example.com>"),
+                    ("ConfigurationSetName", "cs"),
+                    (
+                        "Destination.ToAddresses.member.1",
+                        "Bounce <bounce@simulator.amazonses.com>",
+                    ),
+                    (
+                        "Destinations.member.1",
+                        "Bounce <bounce@simulator.amazonses.com>",
+                    ),
+                    ("RawMessage.Data", &raw),
+                    ("Template", "tpl"),
+                    ("TemplateData", "{}"),
+                    (
+                        "Destinations.member.1.Destination.ToAddresses.member.1",
+                        "Bounce <bounce@simulator.amazonses.com>",
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status.is_success(), "{action}");
+        let calls = recorder.records.lock().unwrap();
+        assert_eq!(calls.len(), 2, "{action} emits Send and Bounce");
+        for (_, event) in calls.iter() {
+            assert_eq!(event["mail"]["source"], "sender@example.com");
+            assert_eq!(
+                event["mail"]["destination"],
+                json!(["bounce@simulator.amazonses.com"])
+            );
+        }
+        assert_eq!(calls[1].1["eventType"], "Bounce");
+        assert_eq!(
+            calls[1].1["bounce"]["bouncedRecipients"][0]["emailAddress"],
+            "bounce@simulator.amazonses.com"
+        );
+        let accounts = svc.state.read();
+        let sent = &accounts.default_ref().sent_emails[0];
+        assert_eq!(sent.from, "Sender <sender@example.com>");
+        assert_eq!(sent.to, ["Bounce <bounce@simulator.amazonses.com>"]);
+        assert_eq!(
+            sent.delivery_insights[0].destination,
+            "bounce@simulator.amazonses.com"
+        );
+        assert_eq!(
+            sent.delivery_insights[0]
+                .events
+                .iter()
+                .map(|e| e.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["SEND", "BOUNCE"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn review_api_group_cannot_bypass_sandbox_recipient_verification() {
+    let (svc, recorder) = event_service();
+    create_v1_event_config(&svc, "cs").await;
+    svc.state
+        .write()
+        .default_mut()
+        .account_settings
+        .production_access_enabled = false;
+    let result = svc
+        .handle(query_request(
+            "SendEmail",
+            &[
+                ("Source", "sender@example.com"),
+                ("ConfigurationSetName", "cs"),
+                (
+                    "Destination.ToAddresses.member.1",
+                    "Team: one@other.test, two@other.test;",
+                ),
+            ],
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "a non-mailbox API value must not skip the sandbox check"
+    );
+    assert!(recorder.records.lock().unwrap().is_empty());
+    assert!(svc.state.read().default_ref().sent_emails.is_empty());
+}
+
+#[tokio::test]
+async fn v1_bulk_cc_only_destination_publishes_with_replacement_tags() {
+    let (svc, recorder) = event_service();
+    create_v1_event_config(&svc, "cs").await;
+    let resp = svc
+        .handle(query_request(
+            "SendBulkTemplatedEmail",
+            &[
+                ("Source", "sender@example.com"),
+                ("ConfigurationSetName", "cs"),
+                ("Template", "tpl"),
+                ("DefaultTemplateData", r#"{"name":"Ada"}"#),
+                (
+                    "Destinations.member.1.Destination.CcAddresses.member.1",
+                    "cc@example.com",
+                ),
+                (
+                    "Destinations.member.1.ReplacementTemplateData",
+                    r#"{"name":"Grace"}"#,
+                ),
+                ("DefaultTags.member.1.Name", "campaign"),
+                ("DefaultTags.member.1.Value", "fall"),
+                ("DefaultTags.member.2.Name", "team"),
+                ("DefaultTags.member.2.Value", "ses"),
+                (
+                    "Destinations.member.1.ReplacementTags.member.1.Name",
+                    "campaign",
+                ),
+                (
+                    "Destinations.member.1.ReplacementTags.member.1.Value",
+                    "winter",
+                ),
+            ],
+        ))
+        .await
+        .unwrap();
+    let xml = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+    assert!(xml.contains("<Status>Success</Status>"), "{xml}");
+    let calls = recorder.records.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let event = &calls[0].1;
+    assert_eq!(event["mail"]["destination"], json!(["cc@example.com"]));
+    assert_eq!(event["mail"]["tags"]["campaign"], json!(["winter"]));
+    assert_eq!(event["mail"]["tags"]["team"], json!(["ses"]));
+    let accounts = svc.state.read();
+    assert_eq!(
+        accounts.default_ref().sent_emails[0].subject.as_deref(),
+        Some("Hello Grace")
+    );
+}
+
 fn make_request_with_query(
     method: Method,
     path: &str,
@@ -374,21 +1575,20 @@ async fn test_send_email_raw_content() {
     seed_identity(&state, "sender@example.com");
     enable_production_access(&state);
     let svc = SesV2Service::new(state.clone());
+    // Raw.Data is a JSON-protocol blob, serialized as base64 by the SDK.
+    let raw = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        "From: sender@example.com\r\nTo: to@example.com\r\nSubject: Raw\r\n\r\nBody",
+    );
+    let request_body = json!({
+        "FromEmailAddress":"sender@example.com", "Destination":{"ToAddresses":["to@example.com"]},
+        "Content":{"Raw":{"Data":raw}}
+    });
 
     let req = make_request(
         Method::POST,
         "/v2/email/outbound-emails",
-        r#"{
-            "FromEmailAddress": "sender@example.com",
-            "Destination": {
-                "ToAddresses": ["to@example.com"]
-            },
-            "Content": {
-                "Raw": {
-                    "Data": "From: sender@example.com\r\nTo: to@example.com\r\nSubject: Raw\r\n\r\nBody"
-                }
-            }
-        }"#,
+        &request_body.to_string(),
     );
     let resp = svc.handle(req).await.unwrap();
     assert_eq!(resp.status, StatusCode::OK);
@@ -398,7 +1598,7 @@ async fn test_send_email_raw_content() {
     let _mas_r = state.read();
     let s = _mas_r.default_ref();
     assert_eq!(s.sent_emails.len(), 1);
-    assert!(s.sent_emails[0].raw_data.is_some());
+    assert_eq!(s.sent_emails[0].raw_data.as_deref(), Some(raw.as_str()));
     assert!(
         s.sent_emails[0].subject.is_none(),
         "Raw emails should not have parsed subject"

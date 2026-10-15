@@ -1212,15 +1212,17 @@ fn test_send_raw_email() {
     let state = make_state();
     seed_identity(&state, "sender@example.com");
     enable_production_access(&state);
+    // RawMessage.Data is a Query-protocol blob, encoded as base64 on the wire.
+    let raw = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        "From: sender@example.com\r\nTo: to@example.com\r\nSubject: Test\r\n\r\nBody",
+    );
     let req = make_v1_request(
         "SendRawEmail",
         vec![
             ("Source", "sender@example.com"),
             ("Destinations.member.1", "to@example.com"),
-            (
-                "RawMessage.Data",
-                "From: sender@example.com\r\nTo: to@example.com\r\nSubject: Test\r\n\r\nBody",
-            ),
+            ("RawMessage.Data", &raw),
         ],
     );
     let resp = handle_v1_action(&state, &req).unwrap();

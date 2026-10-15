@@ -142,8 +142,8 @@ pub fn signed_headers_for_sent_email(
     state: &SesState,
     sent: &SentEmail,
 ) -> Option<(String, Vec<(String, String)>)> {
-    let address = address_part(&sent.from);
-    let domain = address.split('@').nth(1)?;
+    let address = crate::mime::mailbox_address(&sent.from)?.to_lowercase();
+    let domain = address.rsplit_once('@')?.1;
     let identity = state
         .identities
         .get(&address)
@@ -185,15 +185,6 @@ pub fn signed_headers_for_sent_email(
     all_headers.push(("DKIM-Signature".to_string(), signature.clone()));
     all_headers.extend(signed_headers);
     Some((signature, all_headers))
-}
-
-fn address_part(from: &str) -> String {
-    if let (Some(open), Some(close)) = (from.find('<'), from.rfind('>')) {
-        if open < close {
-            return from[open + 1..close].trim().to_lowercase();
-        }
-    }
-    from.trim().to_lowercase()
 }
 
 fn parse_private_key(pem: &str) -> Option<RsaPrivateKey> {

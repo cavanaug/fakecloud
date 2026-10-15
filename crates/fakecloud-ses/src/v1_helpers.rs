@@ -43,6 +43,14 @@ pub fn handle_v1_action(
     state: &SharedSesState,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
+    handle_v1_action_with_delivery(state, req, None)
+}
+
+pub(crate) fn handle_v1_action_with_delivery(
+    state: &SharedSesState,
+    req: &AwsRequest,
+    delivery_ctx: Option<&crate::fanout::SesDeliveryContext>,
+) -> Result<AwsResponse, AwsServiceError> {
     match req.action.as_str() {
         // Identity management
         "VerifyEmailIdentity" => verify_email_identity(state, req),
@@ -67,10 +75,10 @@ pub fn handle_v1_action(
         }
         "SetIdentityMailFromDomain" => set_identity_mail_from_domain(state, req),
         // Sending
-        "SendEmail" => send_email(state, req),
-        "SendRawEmail" => send_raw_email(state, req),
-        "SendTemplatedEmail" => send_templated_email(state, req),
-        "SendBulkTemplatedEmail" => send_bulk_templated_email(state, req),
+        "SendEmail" => send_email(state, req, delivery_ctx),
+        "SendRawEmail" => send_raw_email(state, req, delivery_ctx),
+        "SendTemplatedEmail" => send_templated_email(state, req, delivery_ctx),
+        "SendBulkTemplatedEmail" => send_bulk_templated_email(state, req, delivery_ctx),
         "SendBounce" => send_bounce(state, req),
         // Templates
         "CreateTemplate" => create_template(state, req),
@@ -138,15 +146,8 @@ pub(crate) fn required_param<'a>(
 }
 
 /// Strip display-name wrappers like `Foo <foo@example.com>`.
-fn extract_email_address(from: &str) -> &str {
-    if let Some(start) = from.rfind('<') {
-        if let Some(end) = from.rfind('>') {
-            if end > start {
-                return from[start + 1..end].trim();
-            }
-        }
-    }
-    from.trim()
+fn extract_email_address(from: &str) -> String {
+    crate::mime::mailbox_address(from).unwrap_or_default()
 }
 
 /// True for mailbox-simulator addresses. Real SES treats every address
@@ -154,7 +155,7 @@ fn extract_email_address(from: &str) -> &str {
 /// behavior so callers can exercise bounce/complaint/suppression flows
 /// without having to register the simulator domain as a verified identity.
 fn is_simulator_address(email: &str) -> bool {
-    matches!(email.split_once('@'), Some((_, "simulator.amazonses.com")))
+    matches!(email.rsplit_once('@'), Some((_, "simulator.amazonses.com")))
 }
 
 /// Match an email against verified identities (exact email or verified
@@ -172,7 +173,7 @@ fn identity_is_verified(st: &SesState, email: &str) -> bool {
     {
         return true;
     }
-    if let Some((_, domain)) = email.split_once('@') {
+    if let Some((_, domain)) = email.rsplit_once('@') {
         if !domain.is_empty()
             && st
                 .identities
@@ -207,7 +208,7 @@ pub(crate) fn check_v1_verified_sender(
     let accounts = state.read();
     let verified = accounts
         .get(account_id)
-        .map(|st| identity_is_verified(st, email))
+        .map(|st| identity_is_verified(st, &email))
         .unwrap_or(false);
 
     if verified {
@@ -229,6 +230,14 @@ pub(crate) fn check_v1_verified_recipients(
     account_id: &str,
     recipients: &[String],
 ) -> Result<(), AwsServiceError> {
+    let recipients =
+        crate::mime::api_recipients(recipients.iter().map(String::as_str)).map_err(|_| {
+            AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameterValue",
+                "Recipients must contain at least one valid single mailbox",
+            )
+        })?;
     let accounts = state.read();
     let Some(st) = accounts.get(account_id) else {
         return Ok(());
@@ -237,12 +246,8 @@ pub(crate) fn check_v1_verified_recipients(
         return Ok(());
     }
     let mut failing: Vec<String> = Vec::new();
-    for raw in recipients {
-        let addr = extract_email_address(raw);
-        if addr.is_empty() {
-            continue;
-        }
-        if !identity_is_verified(st, addr) {
+    for addr in recipients {
+        if !identity_is_verified(st, &addr) {
             failing.push(addr.to_string());
         }
     }
@@ -314,7 +319,7 @@ pub(crate) fn check_v1_recipients_not_suppressed(
             if addr.is_empty() {
                 continue;
             }
-            if st.suppressed_match(addr, config_set_name).is_some() {
+            if st.suppressed_match(&addr, config_set_name).is_some() {
                 hit = true;
                 break;
             }
@@ -354,7 +359,7 @@ pub(crate) fn is_address_suppressed(
     let Some(st) = accounts.get(account_id) else {
         return false;
     };
-    st.suppressed_match(extract_email_address(addr), config_set_name)
+    st.suppressed_match(&extract_email_address(addr), config_set_name)
         .is_some()
 }
 
@@ -1408,9 +1413,17 @@ fn parse_event_destination_target(
 pub(crate) fn send_email(
     state: &SharedSesState,
     req: &AwsRequest,
+    delivery_ctx: Option<&crate::fanout::SesDeliveryContext>,
 ) -> Result<AwsResponse, AwsServiceError> {
     let from = required_param(&req.query_params, "Source")?;
-    let config_set_name = req.query_params.get("ConfigurationSetName").cloned();
+    let config_set_name = crate::fanout::resolve_config_set(
+        state,
+        &req.account_id,
+        req.query_params
+            .get("ConfigurationSetName")
+            .map(String::as_str),
+        from,
+    );
     check_v1_sending_enabled(state, &req.account_id, config_set_name.as_deref())?;
     check_v1_verified_sender(state, &req.account_id, from)?;
     let to = parse_member_list(&req.query_params, "Destination.ToAddresses");
@@ -1457,22 +1470,54 @@ pub(crate) fn send_email(
         dkim_signature: None,
         headers: Vec::new(),
         timestamp: Utc::now(),
-        email_tags: Vec::new(),
+        email_tags: parse_message_tags(&req.query_params, "Tags"),
         delivery_insights: Vec::new(),
     };
-    let sent = sign_sent_email(state, &req.account_id, &req.region, sent);
-
-    state
-        .write()
-        .get_or_create(&req.account_id)
-        .sent_emails
-        .push(sent);
+    record_sent_email(state, req, delivery_ctx, sent, config_set_name.as_deref());
 
     let inner = format!("<MessageId>{message_id}</MessageId>");
     Ok(AwsResponse::xml(
         StatusCode::OK,
         query_response_xml("SendEmail", SES_NS, &inner, &req.request_id),
     ))
+}
+
+fn parse_message_tags(params: &HashMap<String, String>, prefix: &str) -> Vec<(String, String)> {
+    (1..)
+        .map_while(|i| {
+            Some((
+                params.get(&format!("{prefix}.member.{i}.Name"))?.clone(),
+                params.get(&format!("{prefix}.member.{i}.Value"))?.clone(),
+            ))
+        })
+        .collect()
+}
+
+/// Called only after send validation succeeds, with no SES state guard held.
+fn record_sent_email(
+    state: &SharedSesState,
+    req: &AwsRequest,
+    delivery_ctx: Option<&crate::fanout::SesDeliveryContext>,
+    sent: SentEmail,
+    config_set_name: Option<&str>,
+) {
+    let mut sent = sign_sent_email(state, &req.account_id, &req.region, sent);
+    if let Some(ctx) = delivery_ctx {
+        crate::fanout::process_send_events(
+            ctx,
+            crate::fanout::SendScope {
+                account_id: &req.account_id,
+                region: &req.region,
+            },
+            &mut sent,
+            config_set_name,
+        );
+    }
+    state
+        .write()
+        .get_or_create(&req.account_id)
+        .sent_emails
+        .push(sent);
 }
 
 /// DKIM-sign `sent` against the account's stored identities. No-op when
@@ -1502,17 +1547,69 @@ fn sign_sent_email(
 pub(crate) fn send_raw_email(
     state: &SharedSesState,
     req: &AwsRequest,
+    delivery_ctx: Option<&crate::fanout::SesDeliveryContext>,
 ) -> Result<AwsResponse, AwsServiceError> {
     let raw_data = required_param(&req.query_params, "RawMessage.Data")?;
-    let from = req.query_params.get("Source").cloned().unwrap_or_default();
-    let config_set_name = req.query_params.get("ConfigurationSetName").cloned();
+    let raw_mail = crate::mime::RawMail::parse(raw_data).map_err(|_| {
+        AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidParameterValue",
+            "RawMessage.Data must be base64 encoded",
+        )
+    })?;
+    let from = req
+        .query_params
+        .get("Source")
+        .map(String::as_str)
+        .or_else(|| raw_mail.header("From"))
+        .unwrap_or_default()
+        .to_string();
+    let explicit_config = req
+        .query_params
+        .get("ConfigurationSetName")
+        .map(String::as_str)
+        .or_else(|| raw_mail.header("X-SES-CONFIGURATION-SET"));
+    let config_set_name =
+        crate::fanout::resolve_config_set(state, &req.account_id, explicit_config, &from);
     check_v1_sending_enabled(state, &req.account_id, config_set_name.as_deref())?;
-    if !from.is_empty() {
-        check_v1_verified_sender(state, &req.account_id, &from)?;
+    check_v1_verified_sender(state, &req.account_id, &from)?;
+    let mut to = parse_member_list(&req.query_params, "Destinations");
+    let recipient_error = |_| {
+        AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidParameterValue",
+            "Invalid raw recipient field",
+        )
+    };
+    let (cc, bcc) = if to.is_empty() {
+        to = raw_mail.addresses("To").map_err(recipient_error)?;
+        (
+            raw_mail.addresses("Cc").map_err(recipient_error)?,
+            raw_mail.addresses("Bcc").map_err(recipient_error)?,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let recipients = to
+        .iter()
+        .chain(&cc)
+        .chain(&bcc)
+        .cloned()
+        .collect::<Vec<_>>();
+    check_v1_verified_recipients(state, &req.account_id, &recipients)?;
+    check_v1_recipients_not_suppressed(
+        state,
+        &req.account_id,
+        &recipients,
+        config_set_name.as_deref(),
+    )?;
+
+    // Raw-message tags may be supplied in headers. API tags take precedence
+    // as a complete list, rather than being merged with the header tags.
+    let mut email_tags = parse_message_tags(&req.query_params, "Tags");
+    if email_tags.is_empty() {
+        email_tags = raw_mail.message_tags();
     }
-    let to = parse_member_list(&req.query_params, "Destinations");
-    check_v1_verified_recipients(state, &req.account_id, &to)?;
-    check_v1_recipients_not_suppressed(state, &req.account_id, &to, config_set_name.as_deref())?;
 
     let message_id = format!(
         "{:016x}{:016x}-{:08x}-{:04x}",
@@ -1526,9 +1623,9 @@ pub(crate) fn send_raw_email(
         message_id: message_id.clone(),
         from,
         to,
-        cc: Vec::new(),
-        bcc: Vec::new(),
-        subject: None,
+        cc,
+        bcc,
+        subject: raw_mail.header("Subject").map(str::to_string),
         html_body: None,
         text_body: None,
         raw_data: Some(raw_data.to_string()),
@@ -1537,16 +1634,10 @@ pub(crate) fn send_raw_email(
         dkim_signature: None,
         headers: Vec::new(),
         timestamp: Utc::now(),
-        email_tags: Vec::new(),
+        email_tags,
         delivery_insights: Vec::new(),
     };
-    let sent = sign_sent_email(state, &req.account_id, &req.region, sent);
-
-    state
-        .write()
-        .get_or_create(&req.account_id)
-        .sent_emails
-        .push(sent);
+    record_sent_email(state, req, delivery_ctx, sent, config_set_name.as_deref());
 
     let inner = format!("<MessageId>{message_id}</MessageId>");
     Ok(AwsResponse::xml(
@@ -1558,9 +1649,17 @@ pub(crate) fn send_raw_email(
 pub(crate) fn send_templated_email(
     state: &SharedSesState,
     req: &AwsRequest,
+    delivery_ctx: Option<&crate::fanout::SesDeliveryContext>,
 ) -> Result<AwsResponse, AwsServiceError> {
     let from = required_param(&req.query_params, "Source")?;
-    let config_set_name = req.query_params.get("ConfigurationSetName").cloned();
+    let config_set_name = crate::fanout::resolve_config_set(
+        state,
+        &req.account_id,
+        req.query_params
+            .get("ConfigurationSetName")
+            .map(String::as_str),
+        from,
+    );
     check_v1_sending_enabled(state, &req.account_id, config_set_name.as_deref())?;
     check_v1_verified_sender(state, &req.account_id, from)?;
     let template_name = required_param(&req.query_params, "Template")?;
@@ -1630,16 +1729,10 @@ pub(crate) fn send_templated_email(
         dkim_signature: None,
         headers: Vec::new(),
         timestamp: Utc::now(),
-        email_tags: Vec::new(),
+        email_tags: parse_message_tags(&req.query_params, "Tags"),
         delivery_insights: Vec::new(),
     };
-    let sent = sign_sent_email(state, &req.account_id, &req.region, sent);
-
-    state
-        .write()
-        .get_or_create(&req.account_id)
-        .sent_emails
-        .push(sent);
+    record_sent_email(state, req, delivery_ctx, sent, config_set_name.as_deref());
 
     let inner = format!("<MessageId>{message_id}</MessageId>");
     Ok(AwsResponse::xml(
@@ -1651,9 +1744,17 @@ pub(crate) fn send_templated_email(
 pub(crate) fn send_bulk_templated_email(
     state: &SharedSesState,
     req: &AwsRequest,
+    delivery_ctx: Option<&crate::fanout::SesDeliveryContext>,
 ) -> Result<AwsResponse, AwsServiceError> {
     let from = required_param(&req.query_params, "Source")?;
-    let config_set_name = req.query_params.get("ConfigurationSetName").cloned();
+    let config_set_name = crate::fanout::resolve_config_set(
+        state,
+        &req.account_id,
+        req.query_params
+            .get("ConfigurationSetName")
+            .map(String::as_str),
+        from,
+    );
     check_v1_sending_enabled(state, &req.account_id, config_set_name.as_deref())?;
     check_v1_verified_sender(state, &req.account_id, from)?;
     let template_name = required_param(&req.query_params, "Template")?;
@@ -1679,9 +1780,12 @@ pub(crate) fn send_bulk_templated_email(
     let mut inner = String::from("<Status>");
     for i in 1.. {
         let dest_prefix = format!("Destinations.member.{i}");
-        if !req
-            .query_params
-            .contains_key(&format!("{dest_prefix}.Destination.ToAddresses.member.1"))
+        if !["ToAddresses", "CcAddresses", "BccAddresses"]
+            .iter()
+            .any(|kind| {
+                req.query_params
+                    .contains_key(&format!("{dest_prefix}.Destination.{kind}.member.1"))
+            })
         {
             break;
         }
@@ -1723,7 +1827,7 @@ pub(crate) fn send_bulk_templated_email(
             );
             continue;
         }
-        let message_id = send_bulk_destination(
+        let mut sent = send_bulk_destination(
             state,
             &req.query_params,
             &dest_prefix,
@@ -1732,6 +1836,19 @@ pub(crate) fn send_bulk_templated_email(
             &default_template_data,
             &req.account_id,
         );
+        let mut tags = parse_message_tags(&req.query_params, "DefaultTags");
+        for (name, value) in
+            parse_message_tags(&req.query_params, &format!("{dest_prefix}.ReplacementTags"))
+        {
+            if let Some(tag) = tags.iter_mut().find(|(n, _)| *n == name) {
+                tag.1 = value;
+            } else {
+                tags.push((name, value));
+            }
+        }
+        sent.email_tags = tags;
+        let message_id = sent.message_id.clone();
+        record_sent_email(state, req, delivery_ctx, sent, config_set_name.as_deref());
         inner.push_str(&format!(
             "<member><Status>Success</Status><MessageId>{message_id}</MessageId></member>"
         ));
@@ -1743,8 +1860,7 @@ pub(crate) fn send_bulk_templated_email(
     ))
 }
 
-/// Record one destination entry from a SendBulkTemplatedEmail call and
-/// return the generated message id.
+/// Build one successful destination entry from a SendBulkTemplatedEmail call.
 pub(crate) fn send_bulk_destination(
     state: &SharedSesState,
     params: &HashMap<String, String>,
@@ -1753,7 +1869,7 @@ pub(crate) fn send_bulk_destination(
     template_name: &str,
     default_template_data: &str,
     account_id: &str,
-) -> String {
+) -> SentEmail {
     let to = parse_member_list(params, &format!("{dest_prefix}.Destination.ToAddresses"));
     let replacement_data = params
         .get(&format!("{dest_prefix}.ReplacementTemplateData"))
@@ -1780,12 +1896,12 @@ pub(crate) fn send_bulk_destination(
         .as_ref()
         .map(|t| crate::service::templates::render_template(t, &replacement_data));
 
-    let sent = SentEmail {
+    SentEmail {
         message_id: message_id.clone(),
         from: from.to_string(),
         to,
-        cc: Vec::new(),
-        bcc: Vec::new(),
+        cc: parse_member_list(params, &format!("{dest_prefix}.Destination.CcAddresses")),
+        bcc: parse_member_list(params, &format!("{dest_prefix}.Destination.BccAddresses")),
         subject: rendered.as_ref().and_then(|r| r.subject.clone()),
         html_body: rendered.as_ref().and_then(|r| r.html.clone()),
         text_body: rendered.as_ref().and_then(|r| r.text.clone()),
@@ -1797,15 +1913,7 @@ pub(crate) fn send_bulk_destination(
         timestamp: Utc::now(),
         email_tags: Vec::new(),
         delivery_insights: Vec::new(),
-    };
-    let sent = sign_sent_email(state, account_id, "", sent);
-
-    state
-        .write()
-        .get_or_create(account_id)
-        .sent_emails
-        .push(sent);
-    message_id
+    }
 }
 
 pub(crate) fn send_bounce(
