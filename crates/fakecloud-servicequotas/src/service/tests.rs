@@ -877,6 +877,240 @@ fn provider(s: &ServiceQuotasService) -> crate::ServiceQuotasProvider {
 
 const ACCT: &str = "000000000000";
 
+fn firehose_call(
+    s: &ServiceQuotasService,
+    account: &str,
+    region: &str,
+    action: &str,
+    body: Value,
+) -> Value {
+    let resp = dispatch(s, &req_in(account, region, action, body)).expect("op ok");
+    serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+}
+
+#[test]
+fn firehose_quota_gets_lists_and_introspection_use_regional_defaults() {
+    let s = svc();
+    for (region, expected) in [
+        ("us-east-1", [2000.0, 500_000.0, 5.0]),
+        ("us-west-2", [2000.0, 500_000.0, 5.0]),
+        ("eu-west-1", [2000.0, 500_000.0, 5.0]),
+        ("us-east-2", [1000.0, 100_000.0, 1.0]),
+    ] {
+        for (code, expected) in ["L-7681C790", "L-17D4EADE", "L-937C879B"]
+            .into_iter()
+            .zip(expected)
+        {
+            let body = json!({"ServiceCode": "firehose", "QuotaCode": code});
+            for action in ["GetAWSDefaultServiceQuota", "GetServiceQuota"] {
+                let q = firehose_call(&s, ACCT, region, action, body.clone());
+                assert_eq!(q["Quota"]["Value"], expected, "{action}/{region}/{code}");
+                assert_eq!(q["Quota"]["Adjustable"], false);
+                assert_eq!(q["Quota"]["GlobalQuota"], false);
+            }
+            for action in ["ListAWSDefaultServiceQuotas", "ListServiceQuotas"] {
+                let list =
+                    firehose_call(&s, ACCT, region, action, json!({"ServiceCode": "firehose"}));
+                let q = list["Quotas"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|q| q["QuotaCode"] == code)
+                    .unwrap();
+                assert_eq!(q["Value"], expected, "{action}/{region}/{code}");
+                assert_eq!(q["Adjustable"], false);
+            }
+            let list = s
+                .introspect_quotas(None, Some(region), Some("firehose"))
+                .unwrap();
+            let q = list["quotas"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["quotaCode"] == code)
+                .unwrap();
+            assert_eq!(q["defaultValue"], expected, "{region}/{code}");
+            assert_eq!(q["appliedValue"], expected);
+            assert_eq!(q["enforceable"], true);
+            assert_eq!(q["enforced"], false);
+        }
+        // Nearby quotas must not acquire Firehose throughput defaults.
+        for (service, code, expected) in [
+            ("firehose", "L-14BB0BE7", 5000.0),
+            ("vpc", "L-F678F1CE", 5.0),
+        ] {
+            for action in ["GetAWSDefaultServiceQuota", "GetServiceQuota"] {
+                let q = firehose_call(
+                    &s,
+                    ACCT,
+                    region,
+                    action,
+                    json!({"ServiceCode": service, "QuotaCode": code}),
+                );
+                assert_eq!(q["Quota"]["Value"], expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn firehose_local_values_are_unrestricted_scoped_and_deleted_to_regional_defaults() {
+    use fakecloud_core::quota::QuotaProvider;
+    let s = svc();
+    let p = provider(&s);
+    for (code, high, low) in [
+        ("L-7681C790", 2000.0, 1000.0),
+        ("L-17D4EADE", 500_000.0, 100_000.0),
+        ("L-937C879B", 5.0, 1.0),
+    ] {
+        for (region, default) in [("us-east-1", high), ("us-east-2", low)] {
+            for value in [0.25, 0.0, 1e12, f64::MAX] {
+                let view = s
+                    .introspect_put_quota(
+                        "firehose",
+                        code,
+                        &PutQuotaRequest {
+                            account_id: Some(ACCT.into()),
+                            region: Some(region.into()),
+                            value: Some(value),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(view["appliedValue"], value);
+                assert_eq!(view["defaultValue"], default);
+                assert_eq!(view["enforced"], false);
+                assert_eq!(p.applied_value(ACCT, region, "firehose", code), Some(value));
+                assert_eq!(p.enforced_limit(ACCT, region, "firehose", code), None);
+                for action in ["GetServiceQuota", "ListServiceQuotas"] {
+                    let q = firehose_call(
+                        &s,
+                        ACCT,
+                        region,
+                        action,
+                        json!({"ServiceCode": "firehose", "QuotaCode": code}),
+                    );
+                    let q = if action == "GetServiceQuota" {
+                        &q["Quota"]
+                    } else {
+                        &q["Quotas"][0]
+                    };
+                    assert_eq!(q["Value"].as_f64(), Some(value));
+                }
+                let aws_default = firehose_call(
+                    &s,
+                    ACCT,
+                    region,
+                    "GetAWSDefaultServiceQuota",
+                    json!({"ServiceCode": "firehose", "QuotaCode": code}),
+                );
+                assert_eq!(aws_default["Quota"]["Value"], default);
+                assert_eq!(
+                    p.applied_value(MEMBER, region, "firehose", code),
+                    Some(default)
+                );
+                let other_region = if region == "us-east-1" {
+                    "us-east-2"
+                } else {
+                    "us-east-1"
+                };
+                let other_default = if region == "us-east-1" { low } else { high };
+                assert_eq!(
+                    p.applied_value(ACCT, other_region, "firehose", code),
+                    Some(other_default)
+                );
+            }
+            s.introspect_put_quota(
+                "firehose",
+                code,
+                &PutQuotaRequest {
+                    account_id: Some(ACCT.into()),
+                    region: Some(region.into()),
+                    enforce: Some(Some(true)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                p.enforced_limit(ACCT, region, "firehose", code),
+                Some(f64::MAX)
+            );
+            assert_eq!(p.enforced_limit(MEMBER, region, "firehose", code), None);
+            let deleted = s
+                .introspect_delete_quota("firehose", code, Some(ACCT), Some(region))
+                .unwrap();
+            assert_eq!(deleted["defaultValue"], default);
+            assert_eq!(deleted["appliedValue"], default);
+            assert_eq!(deleted["enforced"], false);
+            assert_eq!(
+                p.applied_value(ACCT, region, "firehose", code),
+                Some(default)
+            );
+            assert_eq!(p.enforced_limit(ACCT, region, "firehose", code), None);
+        }
+    }
+}
+
+#[test]
+fn firehose_throughput_quotas_remain_non_adjustable() {
+    let s = svc();
+    for code in ["L-7681C790", "L-17D4EADE", "L-937C879B"] {
+        let err = call_err(
+            &s,
+            "RequestServiceQuotaIncrease",
+            json!({
+                "ServiceCode": "firehose", "QuotaCode": code, "DesiredValue": 1_000_000.0,
+            }),
+        );
+        assert_eq!(err.code(), "IllegalArgumentException");
+        assert!(err.message().contains("not adjustable"));
+        for value in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = s
+                .introspect_put_quota(
+                    "firehose",
+                    code,
+                    &PutQuotaRequest {
+                        value: Some(value),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        }
+    }
+}
+
+#[test]
+fn firehose_utilization_reports_use_regional_defaults() {
+    struct FirehoseUsage;
+    impl QuotaUsageSource for FirehoseUsage {
+        fn service_codes(&self) -> &[&str] {
+            &["firehose"]
+        }
+        fn usage(&self, _: &str, _: &str, _: &str, code: &str) -> Option<f64> {
+            (code == "L-937C879B").then_some(0.5)
+        }
+    }
+    let s = svc().with_usage_source(Arc::new(FirehoseUsage));
+    let started = firehose_call(
+        &s,
+        ACCT,
+        "us-east-2",
+        "StartQuotaUtilizationReport",
+        json!({}),
+    );
+    let report = firehose_call(
+        &s,
+        ACCT,
+        "us-east-2",
+        "GetQuotaUtilizationReport",
+        json!({"ReportId": started["ReportId"]}),
+    );
+    assert_eq!(report["Quotas"][0]["DefaultValue"], 1.0);
+    assert_eq!(report["Quotas"][0]["AppliedValue"], 1.0);
+    assert_eq!(report["Quotas"][0]["Utilization"], 50.0);
+}
+
 #[test]
 fn nothing_is_enforced_until_switched_on() {
     use fakecloud_core::quota::QuotaProvider;

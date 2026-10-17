@@ -220,7 +220,7 @@ impl ServiceQuotasService {
             "global": def.global,
             "adjustable": def.adjustable,
             "unit": def.unit,
-            "defaultValue": def.default,
+            "defaultValue": catalog::default_value(region, def),
             "appliedValue": applied_value(data, region, def),
             "usage": usage,
             "enforceable": def.enforceable,

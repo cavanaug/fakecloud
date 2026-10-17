@@ -79,7 +79,9 @@ pub struct QuotaDef {
 }
 
 pub use fakecloud_core::quota::{
-    RULES_PER_SECURITY_GROUP, SECURITY_GROUPS_PER_INTERFACE, VPC_SERVICE_CODE as VPC,
+    FIREHOSE_MIB_PER_SECOND, FIREHOSE_PUT_REQUESTS_PER_SECOND, FIREHOSE_RECORDS_PER_SECOND,
+    FIREHOSE_SERVICE_CODE, RULES_PER_SECURITY_GROUP, SECURITY_GROUPS_PER_INTERFACE,
+    VPC_SERVICE_CODE as VPC,
 };
 
 pub const EC2: &str = "ec2";
@@ -102,6 +104,9 @@ pub const ENFORCEABLE: &[(&str, &str)] = &[
     ("ec2", "L-7295265B"),      // Running On-Demand X instances
     ("ec2", "L-74FC7D96"),      // Running On-Demand F instances
     ("ec2", "L-DB2E81BA"),      // Running On-Demand G and VT instances
+    (FIREHOSE_SERVICE_CODE, FIREHOSE_RECORDS_PER_SECOND), // Records per second per stream
+    (FIREHOSE_SERVICE_CODE, FIREHOSE_PUT_REQUESTS_PER_SECOND), // Put requests per second per stream
+    (FIREHOSE_SERVICE_CODE, FIREHOSE_MIB_PER_SECOND), // MiB per second per stream
     ("iam", "L-0DA4ABF3"),      // Managed policies per role
     ("iam", "L-384571C4"),      // Managed policies per group
     ("iam", "L-4019AD8B"),      // Managed policies per user
@@ -397,6 +402,29 @@ pub fn quota(service_code: &str, quota_code: &str) -> Option<&'static QuotaDef> 
     c.index(service_code, quota_code).map(|i| &c.quotas[i])
 }
 
+/// AWS default in the requested region. Only Firehose's three per-stream
+/// throughput quotas differ from the vendored us-east-1 catalog.
+pub fn default_value(region: &str, def: &QuotaDef) -> f64 {
+    if def.service_code == FIREHOSE_SERVICE_CODE {
+        let high_throughput = matches!(region, "us-east-1" | "us-west-2" | "eu-west-1");
+        match def.quota_code {
+            FIREHOSE_PUT_REQUESTS_PER_SECOND => {
+                return if high_throughput { 2000.0 } else { 1000.0 };
+            }
+            FIREHOSE_RECORDS_PER_SECOND => {
+                return if high_throughput {
+                    500_000.0
+                } else {
+                    100_000.0
+                };
+            }
+            FIREHOSE_MIB_PER_SECOND => return if high_throughput { 5.0 } else { 1.0 },
+            _ => {}
+        }
+    }
+    def.default
+}
+
 /// Every quota of `service_code`, ordered by quota code. Empty for an
 /// unknown service.
 pub fn quotas_of(service_code: &str) -> &'static [QuotaDef] {
@@ -415,6 +443,48 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn firehose_defaults_follow_the_requested_region() {
+        for (code, high, low) in [
+            ("L-7681C790", 2000.0, 1000.0),
+            ("L-17D4EADE", 500_000.0, 100_000.0),
+            ("L-937C879B", 5.0, 1.0),
+        ] {
+            let def = quota("firehose", code).unwrap();
+            for (region, expected) in [
+                ("us-east-1", high),
+                ("us-west-2", high),
+                ("eu-west-1", high),
+                ("us-east-2", low),
+                ("ap-southeast-2", low),
+            ] {
+                assert_eq!(default_value(region, def), expected, "{region}/{code}");
+            }
+            assert!(!def.adjustable);
+            assert!(!def.global);
+            assert!(def.enforceable);
+            assert!(is_enforceable("firehose", code));
+        }
+        // Do not regionalize other Firehose quotas or unrelated services.
+        for (service, code, expected) in [
+            ("firehose", "L-14BB0BE7", 5000.0),
+            ("firehose", "L-040D05FF", 5.0),
+            ("vpc", "L-F678F1CE", 5.0),
+        ] {
+            for region in ["us-east-1", "us-west-2", "eu-west-1", "us-east-2"] {
+                assert_eq!(
+                    default_value(region, quota(service, code).unwrap()),
+                    expected
+                );
+            }
+        }
+        // A matching quota code in another service must keep its own default.
+        let mut other = *quota("firehose", "L-937C879B").unwrap();
+        other.service_code = "other";
+        other.default = 42.0;
+        assert_eq!(default_value("us-east-2", &other), 42.0);
+    }
 
     #[test]
     fn the_vendored_dump_decodes_into_every_listed_service() {

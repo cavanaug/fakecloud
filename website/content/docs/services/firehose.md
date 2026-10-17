@@ -33,6 +33,63 @@ The interval starts with the oldest arrival in a new buffer. After that buffer i
 
 `UpdateDestination` affects data still in the active buffer: when that data becomes eligible, it uses the latest supported destination, hints, output settings, and stream version. Once a batch has detached, its destination, version, codec, destination encryption key, timestamps, and object key are captured and reused for every retry. An unsupported update pauses already accepted active data until the configuration becomes supported again; it does not discard that data. Detached batches continue with their captured configuration. Deleting a stream or resetting the server discards its pending data; recreating the same stream name does not recover the old buffer.
 
+## Opt-in Direct PUT throughput limits
+
+Ingestion quotas control whether public `PutRecord` and `PutRecordBatch` calls are accepted. They are separate from `BufferingHints`, which control when accepted data becomes eligible for S3 delivery. [`DirectPutSourceConfiguration.ThroughputHintInMBs`](https://docs.aws.amazon.com/firehose/latest/APIReference/API_DirectPutSourceConfiguration.html) is informational, not an enforcement control.
+
+The existing [Service Quotas controls](/docs/services/servicequotas/#enforcement) support three `firehose` quotas:
+
+| Quota code | Budget per stream per second | `us-east-1`, `us-west-2`, `eu-west-1` default | All other regions default |
+| --- | --- | --- | --- |
+| `L-7681C790` | Combined `PutRecord` and `PutRecordBatch` requests | 2,000 | 1,000 |
+| `L-17D4EADE` | Records | 500,000 | 100,000 |
+| `L-937C879B` | MiB of decoded record data | 5 | 1 |
+
+One MiB is 1,048,576 bytes. Both public operations share all three budgets: a batch costs one request, plus its valid records and their decoded bytes. Invalid-base64 batch entries do not consume records or bytes; even an all-invalid batch consumes one request. Producer-supplied delimiters count as input bytes; base64 transport encoding, output-added newlines, and compression do not affect the byte budget.
+
+Applied values are configured per account and region, but consumption is **independent for each delivery-stream instance**, not pooled across the region. Streams in the same account and region each receive the full configured budget. Destination updates, buffer flushes, and delivery retries do not reset or consume ingestion capacity. Deleting and recreating a stream starts a new budget; usage windows are process-local and are not persisted.
+
+### Enable and change limits
+
+**Enforcement is off by default.** Use `--enforce-quotas` globally, `--enforce-quota firehose/L-937C879B` for one quota, or the existing introspection API and its Service Quotas SDK wrappers. `--ignore-quota` and per-account overrides retain their existing precedence: account override, then server-wide override, then the global switch. The corresponding `FAKECLOUD_ENFORCE_QUOTAS`, `FAKECLOUD_ENFORCE_QUOTA`, and `FAKECLOUD_IGNORE_QUOTA` environment variables are also supported.
+
+For a running local server, set a 0.5 MiB/second budget for every stream in account `000000000000`, region `us-east-1`, and enforce that quota for the account:
+
+```sh
+curl -fsS -X PUT \
+  http://localhost:4566/_fakecloud/service-quotas/quotas/firehose/L-937C879B \
+  -H 'Content-Type: application/json' \
+  -d '{"accountId":"000000000000","region":"us-east-1","value":0.5,"enforce":true}'
+```
+
+Use the account and region of your producer's AWS client. Omitting `accountId` or `region` selects the server's configured account or region for the applied value, not the caller's AWS identity or signing region. There is an additional scope distinction: with `accountId`, `enforce` changes that account's override across regions; without `accountId`, it changes the server-wide override across accounts and regions. The example changes only the byte quota; requests and records remain unenforced unless separately enabled.
+
+Setting `value` alone leaves enforcement unchanged: on a default server it **does not turn throttling on**. `enforce: false` ignores the quota, `enforce: null` clears the override, and omitting `enforce` preserves it. No new Firehose-specific administration endpoint is required.
+
+The local setter accepts any finite, nonnegative value, including values below the AWS default, zero, and fractional MiB. Fractional request/record limits do not round up to a whole request/record. A zero request limit refuses every metered call; zero records permits no valid records, and zero MiB permits only zero decoded bytes (so an empty record can pass the byte check). All enabled dimensions must allow the call.
+
+Limits are read on each call. Raising a value applies to the next call without clearing usage already consumed in the current window; lowering it can block further admission until replenishment. Previously accepted buffers, delivery retries, and shutdown drains are unaffected. These Firehose quotas keep AWS's non-adjustable Service Quotas metadata: `RequestServiceQuotaIncrease` still refuses them. The local setter is a testing control, not a simulated AWS Support quota-increase workflow.
+
+### Window timing and request errors
+
+fakecloud approximates throughput with fixed, monotonic **one-second windows**. The first successful metered admission anchors a window; the first successful admission at or after its one-second boundary starts the next window at that call's time. Rejection does not consume capacity or move the anchor. Idle time accrues no credits. This is not a token bucket or a rolling-window guarantee: full allowances immediately before and after a boundary can produce a short burst of twice the per-window budget.
+
+There is no automatic scaling: configured capacity remains fixed until changed locally. A single record or batch exceeding an entire configured window cannot succeed merely by backing off and retrying; reduce its size or raise the relevant limit.
+
+If any enabled budget would be exceeded, the **whole call returns HTTP 500 `ServiceUnavailableException`**, before any records enter a buffer or trigger delivery. A rejected batch is not partially admitted and does not receive an HTTP 200 per-entry throughput-failure response. Existing input validation and unsupported-destination errors still precede quota consumption.
+
+With the official AWS SDK for Rust, request retries can delay the result or succeed after a window replenishes. If retryable failures continue until the configured retry attempts are exhausted, `.send().await` returns `Err`, not a successful output containing `FailedPutCount`. See the [Rust SDK retry configuration](https://docs.rs/aws-sdk-firehose/latest/aws_sdk_firehose/config/retry/struct.RetryConfig.html).
+
+By contrast, an HTTP 200 `PutRecordBatch` response can still contain existing per-entry validation failures, such as invalid base64, with results in input order and valid entries admitted. Inspect `FailedPutCount` and `RequestResponses`: the Rust SDK does **not** automatically resubmit failed entries from a successful HTTP 200 batch response. Request retries and per-entry results are separate contracts; neither an API acknowledgment nor successful retry means S3 delivery is durable.
+
+This increment meters only the public Direct PUT APIs, including their configuration-only non-S3 acknowledgments. Internal CloudWatch Logs and SES handoffs still share the buffering engine but are explicitly **unmetered** by these throughput controls. `KinesisStreamAsSource` streams still reject Direct PUT calls; Kinesis-source polling is not implemented.
+
+### AWS references and local differences
+
+The [Firehose quotas guide](https://docs.aws.amazon.com/firehose/latest/dev/limits.html) and [regional quota reference](https://docs.aws.amazon.com/general/latest/gr/fh.html) define the regional defaults and shared per-stream Direct PUT limits. AWS describes proportional quota increases and automatic scaling with unspecified timing; fakecloud does not reproduce either workflow or AWS's internal admission algorithm. Local controls can change each dimension independently.
+
+The [`PutRecord` reference](https://docs.aws.amazon.com/firehose/latest/APIReference/API_PutRecord.html) documents HTTP 500 `ServiceUnavailableException`, but its introductory 5,000-records/second figure conflicts with the 500,000 figure in the quota references for the three high-throughput regions. The table above follows the quota references, not that introductory number. The [`PutRecordBatch` reference](https://docs.aws.amazon.com/firehose/latest/APIReference/API_PutRecordBatch.html) distinguishes whole-call errors from ordered per-record results; it does not specify the exact threshold-allocation algorithm. The fixed windows and whole-call local throughput rejection described here are explicit local approximations.
+
 ## S3 object bytes and names
 
 Create the destination bucket before sending records. Records `abc`, `def\n`, and the binary bytes `00 ff` in one delivery window become exactly `abcdef\n` followed by `00 ff`, whether submitted in one batch or separate calls. For compressed output, those concatenated bytes are encoded in one GZIP or Xerial Snappy stream. Producers must supply their own delimiters, such as a newline for each JSON record, or enable `AppendDelimiterToRecord`, which writes the same records as exactly `abc\ndef\n\n` followed by `00 ff 0a` before any compression.
@@ -157,7 +214,7 @@ An acknowledgment means accepted into process-local memory, not durably delivere
 
 Runtime retries reuse the same captured key and output configuration. As AWS documents for S3 destinations, a failed head is retried every 5 seconds, with no backoff. Retries start on the worker's 1-second tick, so each actual delay can run up to one second longer. Each failed retry logs a warning with the attempt number and the next retry delay. As on AWS for `DirectPut` streams, retries stop 24 hours after a batch's oldest record arrived: the next failed attempt after that discards the batch with a warning naming its record and byte counts, and later batches in the stream proceed. The shutdown drain still makes its single final attempt regardless of age.
 
-**Memory policy:** failed batches remain in memory for up to 24 hours while new valid records continue to be accepted. There is no memory limit, backpressure, or durable pending spool, so memory use can grow with everything accepted during that window of prolonged failure; a process crash loses pending data. Persistent mode stores stream configuration and completed S3 objects, not buffers or retry queues.
+**Memory policy:** failed batches remain in memory for up to 24 hours while new valid records continue to be accepted, subject to any opt-in ingestion quotas. Those quotas are not backlog-aware backpressure: there is no memory limit or durable pending spool, so memory use can grow with everything accepted during that window of prolonged failure; a process crash loses pending data. Persistent mode stores stream configuration and completed S3 objects, not buffers or retry queues.
 
 **Shutdown policy:** graceful shutdown first lets the HTTP server finish in-flight requests, so API callers never see the closed admission. It then closes admission, waits for in-flight writes, and makes one final drain of supported buffered data without waiting for normal size/time hints or the retry interval. If a final head fails, later batches in that stream are not attempted; shutdown reports undelivered record/decoded-byte counts and does not start another retry loop. Unsupported active data is also reported undelivered. Late internal handoffs are refused with `ServiceUnavailableException` (HTTP 503) and dropped. The final drain has no time limit: a large backlog or slow store prolongs shutdown, and a supervisor that kills the process first (for example, after Docker's default 10-second stop timeout) loses whatever was not yet written. With a healthy bucket and store, graceful restart drains buffered records into durable objects; failed final-drain data is not recovered after restart. No flush/admin endpoint is provided.
 

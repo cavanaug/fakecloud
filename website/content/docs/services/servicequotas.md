@@ -10,11 +10,11 @@ persists across restarts in persistent mode. The wire protocol is awsJson1.1
 (x-amz-target `ServiceQuotasV20190624.<Op>`), signing as `servicequotas`.
 
 Quotas are not just reported. Once you switch enforcement on, EC2, IAM,
-DynamoDB, KMS, S3 and Lambda read the applied value of the quotas they check
+DynamoDB, KMS, S3, Lambda and Firehose read the applied value of the quotas they check
 (for EC2 and VPC: security groups and their rules, VPCs, subnets, gateways,
 route tables, network ACLs, network interfaces, endpoints, peering, Elastic IPs,
 VPN connections and the On-Demand and Spot vCPU quotas) from Service Quotas, so
-raising one with `RequestServiceQuotaIncrease` changes what the service accepts.
+raising an adjustable one with `RequestServiceQuotaIncrease` changes what the service accepts.
 Enforcement is
 **opt-in**: by default nothing is enforced, so a local test suite that creates
 more resources than a fresh AWS account allows keeps working. See
@@ -201,6 +201,7 @@ persist across restarts in persistent mode.
 | Customer Master Keys (`kms`/`L-C2F1777E`) | `CreateKey`, `ReplicateKey` (counted in the replica's region) (`LimitExceededException`); customer managed keys in any key state count, including pending deletion, AWS managed keys do not |
 | General purpose buckets (`s3`/`L-DC2B2D3D`) | `CreateBucket` (`TooManyBuckets`); a global quota: one applied value per account, counting buckets across all regions |
 | Function and layer storage (`lambda`/`L-2ACBD22F`) | `CreateFunction`, `UpdateFunctionCode`, `PublishVersion`, `PublishLayerVersion` (`CodeStorageExceededException`); the code of every function's `$LATEST`, published version and layer version counts, container images do not |
+| Firehose requests, records and MiB per second per stream (`firehose`/`L-7681C790`, `L-17D4EADE`, `L-937C879B`) | Public `PutRecord` and `PutRecordBatch` share independent per-stream budgets; whole-call HTTP 500 `ServiceUnavailableException`. Non-adjustable through AWS Service Quotas; use the local setter. See [Firehose throughput limits](/docs/services/firehose/#opt-in-direct-put-throughput-limits) |
 
 IAM refusals are HTTP 409 with IAM's `Cannot exceed quota for <Name>: <limit>`
 message. Every count quota refuses the request that would take the count past
@@ -344,6 +345,7 @@ that concurrency limit, as Lambda always does.
   `GetServiceQuota` and `RequestServiceQuotaIncrease` refuse a `ContextId`
   (saying so) and `ListServiceQuotas` with `QuotaAppliedAtLevel` `RESOURCE`
   returns nothing.
-- Default values are the ones AWS publishes in `us-east-1`. AWS sets some
-  defaults per region; fakecloud reports the `us-east-1` value in every
-  region.
+- Default values are the ones AWS publishes in `us-east-1`, except for the
+  three [Firehose throughput quotas](/docs/services/firehose/#opt-in-direct-put-throughput-limits),
+  which report regional defaults. For other region-dependent defaults,
+  fakecloud reports the `us-east-1` value in every region.

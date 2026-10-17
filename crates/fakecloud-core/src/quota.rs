@@ -24,6 +24,15 @@ pub const DEFAULT_SECURITY_GROUPS_PER_INTERFACE: usize = 5;
 /// AWS default for [`RULES_PER_SECURITY_GROUP`].
 pub const DEFAULT_RULES_PER_SECURITY_GROUP: usize = 60;
 
+/// Service code of the Amazon Data Firehose quotas.
+pub const FIREHOSE_SERVICE_CODE: &str = "firehose";
+/// Combined `PutRecord` and `PutRecordBatch` requests per second per stream.
+pub const FIREHOSE_PUT_REQUESTS_PER_SECOND: &str = "L-7681C790";
+/// Records per second per Firehose delivery stream.
+pub const FIREHOSE_RECORDS_PER_SECOND: &str = "L-17D4EADE";
+/// Mebibytes per second per Firehose delivery stream.
+pub const FIREHOSE_MIB_PER_SECOND: &str = "L-937C879B";
+
 /// Service code of the IAM quotas.
 pub const IAM_SERVICE_CODE: &str = "iam";
 

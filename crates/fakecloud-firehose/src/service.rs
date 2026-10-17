@@ -1145,7 +1145,7 @@ impl FirehoseService {
         stream_name: &str,
         datas: Vec<Vec<u8>>,
     ) -> Result<(), AwsServiceError> {
-        self.engine.enqueue(
+        self.engine.enqueue_put(
             account_id,
             region,
             stream_name,

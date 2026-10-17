@@ -29,7 +29,7 @@ pub fn applied_value(data: Option<&ServiceQuotasData>, region: &str, def: &Quota
             ))
             .copied()
     })
-    .unwrap_or(def.default)
+    .unwrap_or_else(|| catalog::default_value(region, def))
 }
 
 /// The region a quota's ARN and applied value live in: global quotas have
@@ -322,6 +322,44 @@ mod tests {
             Arc::new(RwLock::new(Default::default())),
             Arc::new(RwLock::new(settings)),
         )
+    }
+
+    #[test]
+    fn firehose_provider_defaults_are_regional_and_enforcement_is_opt_in() {
+        let p = provider(Default::default());
+        let before = catalog::catalog_reads();
+        for code in ["L-7681C790", "L-17D4EADE", "L-937C879B"] {
+            assert_eq!(
+                p.enforced_limit("000000000000", "us-east-2", "firehose", code),
+                None
+            );
+        }
+        assert_eq!(catalog::catalog_reads(), before);
+        for (code, high, low) in [
+            ("L-7681C790", 2000.0, 1000.0),
+            ("L-17D4EADE", 500_000.0, 100_000.0),
+            ("L-937C879B", 5.0, 1.0),
+        ] {
+            for (region, expected) in [
+                ("us-east-1", high),
+                ("us-west-2", high),
+                ("eu-west-1", high),
+                ("us-east-2", low),
+            ] {
+                for account in ["000000000000", "222222222222"] {
+                    assert_eq!(
+                        p.applied_value(account, region, "firehose", code),
+                        Some(expected)
+                    );
+                    p.settings.write().enforce_all = true;
+                    assert_eq!(
+                        p.enforced_limit(account, region, "firehose", code),
+                        Some(expected)
+                    );
+                    p.settings.write().enforce_all = false;
+                }
+            }
+        }
     }
 
     /// With enforcement off, an enforcing service's limit lookup on its
