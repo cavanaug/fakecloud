@@ -234,7 +234,7 @@ fn validation_precedes_debit_and_config_only_and_missing_backend_are_metered() {
     });
     assert_eq!(
         put(&f, vec![record(b'a', 1)]).unwrap_err().code(),
-        "NotImplemented"
+        "InvalidArgumentException"
     );
     f.update(NAME, |s| s.destination = None);
     put(&f, vec![record(b'a', 1)]).unwrap();
@@ -278,7 +278,7 @@ async fn retries_do_not_redebit_ingestion() {
     first.reply.send(Action::Fail).unwrap();
     f.finish(&mut jobs).await;
     throttled(put(&f, vec![record(b'x', 1)]));
-    f.advance(1);
+    f.advance(5);
     f.schedule(&mut jobs, true);
     let retry = next_attempt(&mut entered).await;
     assert_eq!(first.batch.object_key, retry.batch.object_key);
