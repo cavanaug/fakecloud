@@ -1111,6 +1111,223 @@ fn firehose_utilization_reports_use_regional_defaults() {
     assert_eq!(report["Quotas"][0]["Utilization"], 50.0);
 }
 
+const FIREHOSE_THROUGHPUT: [&str; 3] = ["L-7681C790", "L-17D4EADE", "L-937C879B"];
+
+fn put_value(s: &ServiceQuotasService, account: &str, region: &str, code: &str, v: f64) -> Value {
+    s.introspect_put_quota(
+        "firehose",
+        code,
+        &PutQuotaRequest {
+            account_id: Some(account.into()),
+            region: Some(region.into()),
+            value: Some(v),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+fn set_override(s: &ServiceQuotasService, code: &str, account: Option<&str>, on: Option<bool>) {
+    s.introspect_put_enforcement(&PutEnforcementRequest {
+        enforce_all: None,
+        overrides: vec![OverrideChange {
+            service_code: "firehose".into(),
+            quota_code: code.into(),
+            account_id: account.map(Into::into),
+            enforce: on,
+        }],
+    })
+    .unwrap();
+}
+
+fn enforce_all(s: &ServiceQuotasService, on: bool) {
+    s.introspect_put_enforcement(&PutEnforcementRequest {
+        enforce_all: Some(on),
+        overrides: vec![],
+    })
+    .unwrap();
+}
+
+/// AWS scales Firehose throughput automatically, so switching enforcement on
+/// is not enough: only a value the account set explicitly in the region is a
+/// limit.
+#[test]
+fn firehose_throughput_is_enforced_only_at_explicit_values() {
+    use fakecloud_core::quota::QuotaProvider;
+    let s = svc();
+    let p = provider(&s);
+    let limit = |account: &str, region: &str, code: &str| {
+        p.enforced_limit(account, region, "firehose", code)
+    };
+
+    enforce_all(&s, true);
+    for code in FIREHOSE_THROUGHPUT {
+        for region in ["us-east-1", "us-east-2"] {
+            assert_eq!(limit(ACCT, region, code), None, "{region}/{code}");
+        }
+    }
+    // Other enforceable quotas are enforced at their applied value as before.
+    assert_eq!(
+        p.enforced_limit(ACCT, "us-east-1", "vpc", "L-0EA8095F"),
+        Some(60.0)
+    );
+
+    enforce_all(&s, false);
+    let values = [10.0, 200.0, 0.5];
+    for (code, v) in FIREHOSE_THROUGHPUT.into_iter().zip(values) {
+        put_value(&s, ACCT, "us-east-2", code, v);
+        assert_eq!(limit(ACCT, "us-east-2", code), None, "not switched on");
+    }
+
+    enforce_all(&s, true);
+    for (code, v) in FIREHOSE_THROUGHPUT.into_iter().zip(values) {
+        assert_eq!(limit(ACCT, "us-east-2", code), Some(v), "{code}");
+        // The value belongs to its account and region only.
+        assert_eq!(limit(ACCT, "us-east-1", code), None);
+        assert_eq!(limit(MEMBER, "us-east-2", code), None);
+    }
+    // A value equal to the AWS default is explicit too.
+    put_value(&s, ACCT, "us-east-1", "L-7681C790", 2000.0);
+    assert_eq!(limit(ACCT, "us-east-1", "L-7681C790"), Some(2000.0));
+
+    // Overrides switch it on and off as for any enforceable quota.
+    enforce_all(&s, false);
+    set_override(&s, "L-17D4EADE", None, Some(true));
+    assert_eq!(limit(ACCT, "us-east-2", "L-17D4EADE"), Some(200.0));
+    assert_eq!(limit(ACCT, "us-east-2", "L-7681C790"), None);
+    put_value(&s, MEMBER, "us-east-2", "L-937C879B", 3.0);
+    assert_eq!(limit(MEMBER, "us-east-2", "L-937C879B"), None);
+    set_override(&s, "L-937C879B", Some(MEMBER), Some(true));
+    assert_eq!(limit(MEMBER, "us-east-2", "L-937C879B"), Some(3.0));
+    assert_eq!(limit(ACCT, "us-east-2", "L-937C879B"), None);
+    set_override(&s, "L-17D4EADE", Some(ACCT), Some(false));
+    assert_eq!(limit(ACCT, "us-east-2", "L-17D4EADE"), None);
+
+    // Deleting the explicit value stops enforcement, even when switched on.
+    set_override(&s, "L-17D4EADE", Some(ACCT), None);
+    enforce_all(&s, true);
+    for (code, v) in FIREHOSE_THROUGHPUT.into_iter().zip(values) {
+        assert_eq!(limit(ACCT, "us-east-2", code), Some(v));
+        s.introspect_delete_quota("firehose", code, None, Some("us-east-2"))
+            .unwrap();
+        assert_eq!(limit(ACCT, "us-east-2", code), None, "{code} deleted");
+    }
+}
+
+#[test]
+fn firehose_introspection_reports_auto_scaling_defaults_as_unenforced() {
+    let s = svc();
+    let view = |account: &str, region: &str, code: &str| -> Value {
+        s.introspect_quotas(Some(account), Some(region), Some("firehose"))
+            .unwrap()["quotas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|q| q["quotaCode"] == code)
+            .unwrap()
+            .clone()
+    };
+    let state = |v: &Value| (v["enforced"].clone(), v["enforcementSource"].clone());
+    let off = |source: &str| (json!(false), json!(source));
+    let on = |source: &str| (json!(true), json!(source));
+
+    for code in FIREHOSE_THROUGHPUT {
+        assert_eq!(state(&view(ACCT, "us-east-2", code)), off("global"));
+    }
+    enforce_all(&s, true);
+    for code in FIREHOSE_THROUGHPUT {
+        assert_eq!(
+            state(&view(ACCT, "us-east-2", code)),
+            off("auto_scaling_default"),
+            "{code}"
+        );
+    }
+    let vpc = s
+        .introspect_quotas(Some(ACCT), Some("us-east-2"), Some("vpc"))
+        .unwrap();
+    let rules = vpc["quotas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["quotaCode"] == "L-0EA8095F")
+        .unwrap();
+    assert_eq!(state(rules), on("global"));
+
+    let code = "L-937C879B";
+    let put = put_value(&s, ACCT, "us-east-2", code, 2.0);
+    assert_eq!(state(&put), on("global"));
+    assert_eq!(state(&view(ACCT, "us-east-2", code)), on("global"));
+    assert_eq!(
+        state(&view(ACCT, "us-east-1", code)),
+        off("auto_scaling_default")
+    );
+    assert_eq!(
+        state(&view(MEMBER, "us-east-2", code)),
+        off("auto_scaling_default")
+    );
+    set_override(&s, code, None, Some(true));
+    assert_eq!(state(&view(ACCT, "us-east-2", code)), on("override"));
+    assert_eq!(
+        state(&view(ACCT, "us-east-1", code)),
+        off("auto_scaling_default")
+    );
+    set_override(&s, code, Some(ACCT), Some(true));
+    assert_eq!(
+        state(&view(ACCT, "us-east-2", code)),
+        on("account_override")
+    );
+    set_override(&s, code, Some(ACCT), Some(false));
+    assert_eq!(
+        state(&view(ACCT, "us-east-2", code)),
+        off("account_override")
+    );
+    set_override(&s, code, Some(ACCT), None);
+    set_override(&s, code, None, None);
+    enforce_all(&s, false);
+    assert_eq!(state(&view(ACCT, "us-east-2", code)), off("global"));
+
+    enforce_all(&s, true);
+    let deleted = s
+        .introspect_delete_quota("firehose", code, Some(ACCT), Some("us-east-2"))
+        .unwrap();
+    assert_eq!(state(&deleted), off("auto_scaling_default"));
+}
+
+/// Another service's limit lookup applies a due Organizations template only
+/// when it enforces something; an unenforced lookup leaves the account alone.
+#[test]
+fn enforced_limit_applies_the_template_only_once_enforced() {
+    use fakecloud_core::quota::QuotaProvider;
+    let o = org_with_member(3600);
+    let s = svc_with(o);
+    run(
+        &s,
+        MGMT,
+        "PutServiceQuotaIncreaseRequestIntoTemplate",
+        json!({ "ServiceCode": "vpc", "QuotaCode": "L-2AFB9258", "AwsRegion": "us-east-1", "DesiredValue": 8.0 }),
+    )
+    .unwrap();
+    run(&s, MGMT, "AssociateServiceQuotaTemplate", json!({})).unwrap();
+    let p = provider(&s);
+    assert_eq!(
+        p.enforced_limit(MEMBER, "us-east-1", "vpc", "L-2AFB9258"),
+        None
+    );
+    assert!(s.state.read().get(MEMBER).is_none(), "template applied");
+
+    enforce_all(&s, true);
+    assert_eq!(
+        p.enforced_limits(MEMBER, "us-east-1", "vpc", &["L-2AFB9258", "L-0EA8095F"]),
+        [Some(8.0), Some(60.0)]
+    );
+    assert_eq!(s.state.read().get(MEMBER).unwrap().requests.len(), 1);
+    assert_eq!(
+        p.enforced_limit(MEMBER, "us-east-1", "vpc", "L-2AFB9258"),
+        Some(8.0)
+    );
+    assert_eq!(s.state.read().get(MEMBER).unwrap().requests.len(), 1);
+}
+
 #[test]
 fn nothing_is_enforced_until_switched_on() {
     use fakecloud_core::quota::QuotaProvider;

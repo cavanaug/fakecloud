@@ -212,7 +212,7 @@ impl ServiceQuotasService {
         def: &QuotaDef,
         usage: Option<f64>,
     ) -> Value {
-        let (enforced, source) = enforcement(settings, data, def);
+        let (enforced, source) = enforcement(settings, data, region, def);
         json!({
             "serviceCode": def.service_code,
             "quotaCode": def.quota_code,
