@@ -120,6 +120,15 @@ from an account outside an organization return
   approval). Accounts that were already members, or
   that joined by invitation, are left alone.
 
+As a fallback, a due template is also applied when the account's quota state is
+next accessed through Service Quotas, an applied-value lookup, or a lookup that
+actually enforces a limit. An enforcement-only lookup with no active limits
+returns without applying the template. This rule applies across enforcing
+services, not just Firehose. A lookup that applies a template rereads the limits
+afterward, including changes made by a concurrent lookup. Firehose's three
+throughput quotas are non-adjustable and cannot be included in an increase
+request template.
+
 ### Tags
 
 **`TagResource`**, **`UntagResource`** and **`ListTagsForResource`** tag the

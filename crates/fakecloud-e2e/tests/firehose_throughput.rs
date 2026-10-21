@@ -242,7 +242,7 @@ async fn payloads(s3: &aws_sdk_s3::Client, bucket: &str, count: usize, gzip: boo
 }
 
 #[tokio::test]
-async fn zero_request_capacity_returns_modeled_http_500_for_both_apis_then_live_raise_recovers() {
+async fn zero_request_capacity_returns_http_500_for_both_apis_then_live_raise_recovers() {
     bounded(async {
         let server = TestServer::start().await;
         let bucket = "fh-throughput-requests";

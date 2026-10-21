@@ -725,17 +725,19 @@ impl EngineCore {
     }
 }
 
-/// The one delivery decision shared by admission, scheduling, and the final
-/// drain, so they cannot disagree about whether a stream can deliver.
-/// `Ok(None)`: no destination is configured, so nothing is written.
+/// Throttle response using the API reference's HTTP 500, not the model's 503.
+/// Closed admission is a separate, local shutdown condition and retains 503.
 pub(crate) fn throughput_error() -> AwsServiceError {
     AwsServiceError::aws_error(
         StatusCode::INTERNAL_SERVER_ERROR,
-        "ServiceUnavailableException",
-        "Slow down.",
+        crate::throughput::THROUGHPUT_ERROR_CODE,
+        crate::throughput::THROUGHPUT_ERROR_MESSAGE,
     )
 }
 
+/// The one delivery decision shared by admission, scheduling, and the final
+/// drain, so they cannot disagree about whether a stream can deliver.
+/// `Ok(None)`: no destination is configured, so nothing is written.
 fn stream_delivery(stream: &DeliveryStream) -> Result<Option<DeliveryConfig>, AwsServiceError> {
     crate::admission::validate_stream_destination(stream)?;
     stream.destination.as_ref().map(delivery_config).transpose()

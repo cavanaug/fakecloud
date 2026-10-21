@@ -334,6 +334,9 @@ impl QuotaProvider for ServiceQuotasProvider {
         #[cfg(test)]
         tests::after_initial_snapshot();
         if !limits.iter().any(Option::is_some) {
+            // This fast path applies to every enforcing service: an ignored
+            // quota must not trigger the lazy organization-template fallback.
+            // Explicit applied-value lookups still apply a due template.
             return limits;
         }
         // Enforcing something touches the account's quotas, which applies a

@@ -224,6 +224,34 @@ fn missing(field: &str) -> AwsServiceError {
     )
 }
 
+fn decode_record_data(value: &Value) -> Result<Bytes, AwsServiceError> {
+    if value.is_null() {
+        return Err(missing("Record.Data"));
+    }
+    let encoded = value.as_str().ok_or_else(|| {
+        AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "SerializationException",
+            "Record.Data must be a base64-encoded string",
+        )
+    })?;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| {
+            AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "SerializationException",
+                "Record.Data must be valid base64",
+            )
+        })?;
+    if data.len() > 1_024_000 {
+        return Err(invalid_argument(
+            "Record.Data exceeds 1,024,000 decoded bytes",
+        ));
+    }
+    Ok(Bytes::from(data))
+}
+
 /// Non-S3 destination base names. Firehose names each destination's input
 /// `<Base>Configuration` (create) / `<Base>Update` (update) and reports it as
 /// `<Base>Description`. fakecloud models S3/ExtendedS3 field-by-field; these
@@ -827,30 +855,11 @@ impl FirehoseService {
             .as_str()
             .ok_or_else(|| missing("DeliveryStreamName"))?
             .to_string();
-        let data_b64 = body["Record"]["Data"]
-            .as_str()
-            .ok_or_else(|| missing("Record.Data"))?;
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(data_b64)
-            .map_err(|_| {
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "SerializationException",
-                    "Record.Data must be valid base64",
-                )
-            })?;
-        if data.len() > 1_024_000 {
-            return Err(invalid_argument(
-                "Record.Data exceeds 1,024,000 decoded bytes",
-            ));
-        }
+        let data = decode_record_data(&body["Record"]["Data"])?;
         let record_id = format!("{}", Uuid::new_v4());
-        let accepted = self.engine.enqueue_put(
-            &req.account_id,
-            &req.region,
-            &name,
-            vec![Bytes::from(data)],
-        )?;
+        let accepted = self
+            .engine
+            .enqueue_put(&req.account_id, &req.region, &name, vec![data])?;
         if !accepted[0] {
             return Err(crate::engine::throughput_error());
         }
@@ -877,28 +886,12 @@ impl FirehoseService {
         let mut datas = Vec::with_capacity(records.len());
         let mut decoded_bytes = 0;
         for r in records {
-            let b64 = r["Data"].as_str();
-            match b64.map(|s| base64::engine::general_purpose::STANDARD.decode(s)) {
-                Some(Ok(data)) => {
-                    if data.len() > 1_024_000 {
-                        return Err(invalid_argument(
-                            "Record.Data exceeds 1,024,000 decoded bytes",
-                        ));
-                    }
-                    decoded_bytes += data.len();
-                    if decoded_bytes > 4_194_304 {
-                        return Err(invalid_argument("Records exceed 4,194,304 decoded bytes"));
-                    }
-                    datas.push(Bytes::from(data));
-                }
-                _ => {
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "SerializationException",
-                        "Record.Data must be a base64-encoded string",
-                    ));
-                }
+            let data = decode_record_data(&r["Data"])?;
+            decoded_bytes += data.len();
+            if decoded_bytes > 4_194_304 {
+                return Err(invalid_argument("Records exceed 4,194,304 decoded bytes"));
             }
+            datas.push(data);
         }
         // One handoff after all decoding/limits: request-wide rejection cannot
         // partially admit data. Only throughput refusal can fail individual entries.
@@ -906,13 +899,19 @@ impl FirehoseService {
             .engine
             .enqueue_put(&req.account_id, &req.region, &name, datas)?;
         let failed = accepted.iter().filter(|admitted| !**admitted).count();
-        let response_records: Vec<_> = accepted.into_iter().map(|admitted| {
-            if admitted {
-                json!({"RecordId": Uuid::new_v4().to_string()})
-            } else {
-                json!({"ErrorCode": "ServiceUnavailableException", "ErrorMessage": "Slow down."})
-            }
-        }).collect();
+        let response_records: Vec<_> = accepted
+            .into_iter()
+            .map(|admitted| {
+                if admitted {
+                    json!({"RecordId": Uuid::new_v4().to_string()})
+                } else {
+                    json!({
+                        "ErrorCode": crate::throughput::THROUGHPUT_ERROR_CODE,
+                        "ErrorMessage": crate::throughput::THROUGHPUT_ERROR_MESSAGE,
+                    })
+                }
+            })
+            .collect();
         Ok(AwsResponse::ok_json(json!({
             "FailedPutCount": failed,
             "Encrypted": false,
@@ -2579,12 +2578,16 @@ mod tests {
     #[test]
     fn malformed_batch_is_request_wide_even_after_valid_or_empty_records() {
         let (svc, _) = memory_fixture();
-        for malformed in [json!({"Data": "%%%"}), json!({}), json!({"Data": 1})] {
+        for (malformed, expected_code) in [
+            (json!({"Data": "%%%"}), "SerializationException"),
+            (json!({}), "InvalidArgumentException"),
+            (json!({"Data": 1}), "SerializationException"),
+        ] {
             let error = batch(&svc, vec![record(b""), record(b"valid"), malformed])
                 .err()
                 .unwrap();
             assert_eq!(error.status(), StatusCode::BAD_REQUEST);
-            assert_eq!(error.code(), "SerializationException");
+            assert_eq!(error.code(), expected_code);
         }
         let error = svc
             .put_record_batch(&request(

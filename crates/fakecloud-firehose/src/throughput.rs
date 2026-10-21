@@ -1,5 +1,8 @@
 use tokio::time::Instant;
 
+pub(crate) const THROUGHPUT_ERROR_CODE: &str = "ServiceUnavailableException";
+pub(crate) const THROUGHPUT_ERROR_MESSAGE: &str = "Slow down.";
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ThroughputLimits {
     pub requests: Option<f64>,

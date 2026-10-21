@@ -411,6 +411,60 @@ async fn public_batch_burst_is_ordered_and_debt_survives_window_rollover() {
 }
 
 #[tokio::test]
+async fn public_record_data_validation_is_consistent_and_never_consumes_capacity() {
+    use fakecloud_core::service::AwsService;
+
+    for (invalid, expected_code) in [
+        (json!({}), "InvalidArgumentException"),
+        (json!({"Data": null}), "InvalidArgumentException"),
+        (json!({"Data": 1}), "SerializationException"),
+        (json!({"Data": false}), "SerializationException"),
+        (json!({"Data": []}), "SerializationException"),
+        (json!({"Data": {}}), "SerializationException"),
+        (json!({"Data": "%%%"}), "SerializationException"),
+    ] {
+        for action in ["PutRecord", "PutRecordBatch"] {
+            let f = Fixture::new(60);
+            enforce(&f, Some(1.0), Some(1.0), Some(1.0 / 1_048_576.0));
+            let svc = crate::FirehoseService::default().with_engine(f.engine.clone());
+            let body = if action == "PutRecord" {
+                json!({"DeliveryStreamName": NAME, "Record": invalid})
+            } else {
+                // A valid leading entry must not be admitted before validation finishes.
+                json!({"DeliveryStreamName": NAME, "Records": [{"Data": "YQ=="}, invalid]})
+            };
+            let error = svc.handle(request(action, body)).await.err().unwrap();
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(error.code(), expected_code, "{action}: {invalid}");
+            assert!(buffered(&f).is_empty(), "{action}: {invalid}");
+
+            let valid = if action == "PutRecord" {
+                json!({"DeliveryStreamName": NAME, "Record": {"Data": "Yg=="}})
+            } else {
+                json!({"DeliveryStreamName": NAME, "Records": [{"Data": "Yg=="}]})
+            };
+            let response = svc.handle(request(action, valid.clone())).await.unwrap();
+            assert_eq!(response.status, StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(response.body.expect_bytes()).unwrap();
+            if action == "PutRecord" {
+                assert!(body["RecordId"].is_string());
+            } else {
+                assert_eq!(body["FailedPutCount"], 0);
+                assert!(body["RequestResponses"][0]["RecordId"].is_string());
+            }
+            assert_eq!(buffered(&f), vec![Bytes::from_static(b"b")]);
+
+            // Successful validation still debits the shared request budget.
+            let error = svc.handle(request(action, valid)).await.err().unwrap();
+            assert_eq!(error.code(), "ServiceUnavailableException");
+            assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(buffered(&f), vec![Bytes::from_static(b"b")]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn malformed_base64_rejects_whole_call_without_consuming_capacity() {
     use fakecloud_core::service::AwsService;
     let f = Fixture::new(60);
