@@ -641,8 +641,7 @@ async fn firehose_put_record_batch_reports_invalid_records() {
         .expect("put batch");
     assert_eq!(resp.failed_put_count(), 0);
 
-    // Wire-level invalid-base64 records should bump FailedPutCount and
-    // surface an ErrorCode on the corresponding response entry.
+    // Invalid base64 rejects the whole request, not individual entries.
     let http = reqwest::Client::new();
     let url = format!("{}/", server.endpoint());
     let body = serde_json::json!({
@@ -666,13 +665,13 @@ async fn firehose_put_record_batch_reports_invalid_records() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
+    assert_eq!(r.status(), 400);
     let json: serde_json::Value = r.json().await.unwrap();
-    assert_eq!(json["FailedPutCount"], 1);
-    let resps = json["RequestResponses"].as_array().unwrap();
-    assert_eq!(resps.len(), 2);
-    assert_eq!(resps[0]["ErrorCode"], "InvalidArgumentException");
-    assert!(resps[1].get("RecordId").is_some());
+    assert!(json["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("SerializationException"));
+    assert!(json.get("RequestResponses").is_none());
 }
 
 #[tokio::test]

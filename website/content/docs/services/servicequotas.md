@@ -164,6 +164,14 @@ a restart or `POST /_fakecloud/reset`, which puts them back to the flags.
 Applied values, per-account overrides and requests are account data and
 persist across restarts in persistent mode.
 
+Firehose's three automatically scaled throughput quotas additionally require an
+explicit applied value for the producer's account and region. Their reported AWS
+defaults never throttle, even with global enforcement enabled; introspection then
+reports `enforced: false` and `enforcementSource: "auto_scaling_default"`. An
+explicit value equal to the default still counts as explicit. This local default
+bypass does not simulate AWS's scaling latency. Usage and burst debt are not
+persisted, unlike applied values and account overrides.
+
 ### Enforceable quotas
 
 | Quota | Enforced by |
@@ -201,7 +209,7 @@ persist across restarts in persistent mode.
 | Customer Master Keys (`kms`/`L-C2F1777E`) | `CreateKey`, `ReplicateKey` (counted in the replica's region) (`LimitExceededException`); customer managed keys in any key state count, including pending deletion, AWS managed keys do not |
 | General purpose buckets (`s3`/`L-DC2B2D3D`) | `CreateBucket` (`TooManyBuckets`); a global quota: one applied value per account, counting buckets across all regions |
 | Function and layer storage (`lambda`/`L-2ACBD22F`) | `CreateFunction`, `UpdateFunctionCode`, `PublishVersion`, `PublishLayerVersion` (`CodeStorageExceededException`); the code of every function's `$LATEST`, published version and layer version counts, container images do not |
-| Firehose requests, records and MiB per second per stream (`firehose`/`L-7681C790`, `L-17D4EADE`, `L-937C879B`) | Public `PutRecord` and `PutRecordBatch` share independent per-stream budgets; whole-call HTTP 500 `ServiceUnavailableException`. Non-adjustable through AWS Service Quotas; use the local setter. See [Firehose throughput limits](/docs/services/firehose/#opt-in-direct-put-throughput-limits) |
+| Firehose requests, records and MiB per second per stream (`firehose`/`L-7681C790`, `L-17D4EADE`, `L-937C879B`) | Public `PutRecord` and `PutRecordBatch` share independent per-stream budgets. Request exhaustion returns whole-call HTTP 500 `ServiceUnavailableException`; record/byte exhaustion produces ordered HTTP 200 batch-entry failures (HTTP 500 for `PutRecord`), with `Slow down.` messages. Positive record/byte allowances tolerate one boundary-crossing record and carry excess forward. Non-adjustable through AWS Service Quotas; use the local setter. See [Firehose throughput limits](/docs/services/firehose/#opt-in-direct-put-throughput-limits) |
 
 IAM refusals are HTTP 409 with IAM's `Cannot exceed quota for <Name>: <limit>`
 message. Every count quota refuses the request that would take the count past

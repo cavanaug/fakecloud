@@ -16,13 +16,17 @@ impl QuotaProvider for LimitsProvider {
         panic!("admission must use enforced_limit")
     }
 
-    fn enforced_limit(
+    fn enforced_limit(&self, _: &str, _: &str, _: &str, _: &str) -> Option<f64> {
+        panic!("admission must resolve all limits in one batched lookup")
+    }
+
+    fn enforced_limits(
         &self,
         account: &str,
         region: &str,
         service: &str,
-        code: &str,
-    ) -> Option<f64> {
+        codes: &[&str],
+    ) -> Vec<Option<f64>> {
         assert_eq!(service, FIREHOSE_SERVICE_CODE);
         if self.probe_locks.load(std::sync::atomic::Ordering::Relaxed) {
             let engine = self.engine.upgrade().unwrap();
@@ -41,12 +45,15 @@ impl QuotaProvider for LimitsProvider {
                 .expect("provider under registry lock");
         }
         let limits = *self.limits.read();
-        match code {
-            FIREHOSE_PUT_REQUESTS_PER_SECOND => limits.requests,
-            FIREHOSE_RECORDS_PER_SECOND => limits.records,
-            FIREHOSE_MIB_PER_SECOND => limits.mib,
-            _ => panic!("unexpected quota {code}"),
-        }
+        codes
+            .iter()
+            .map(|code| match *code {
+                FIREHOSE_PUT_REQUESTS_PER_SECOND => limits.requests,
+                FIREHOSE_RECORDS_PER_SECOND => limits.records,
+                FIREHOSE_MIB_PER_SECOND => limits.mib,
+                _ => panic!("unexpected quota {code}"),
+            })
+            .collect()
     }
 }
 
@@ -70,14 +77,12 @@ fn enforce(
 }
 
 fn put(f: &Fixture, records: Vec<Bytes>) -> Result<(), AwsServiceError> {
-    crate::FirehoseService::default()
-        .with_engine(f.engine.clone())
-        .deliver_records(
-            ACCOUNT,
-            REGION,
-            NAME,
-            records.into_iter().map(|b| b.to_vec()).collect(),
-        )
+    let admitted = f.engine.enqueue_put(ACCOUNT, REGION, NAME, records)?;
+    if admitted.iter().all(|admitted| *admitted) {
+        Ok(())
+    } else {
+        Err(throughput_error())
+    }
 }
 
 fn throttled(result: Result<(), AwsServiceError>) {
@@ -121,14 +126,14 @@ fn provider_resolution_precedes_firehose_locks() {
 }
 
 #[tokio::test]
-async fn single_and_batch_share_all_dimensions_with_atomic_rejection() {
+async fn single_and_batch_share_all_dimensions_with_ordered_admission() {
     for dimension in ["requests", "records", "bytes"] {
         let f = Fixture::new(60);
         enforce(
             &f,
             Some(3.0),
             Some(if dimension == "bytes" { 5.0 } else { 4.0 }),
-            Some(12.0 / 1_048_576.0),
+            Some(10.0 / 1_048_576.0),
         );
         put(&f, vec![record(b'a', 4)]).unwrap();
         put(&f, vec![record(b'b', 2), record(b'c', 2)]).unwrap();
@@ -143,17 +148,21 @@ async fn single_and_batch_share_all_dimensions_with_atomic_rejection() {
             throttled(put(&f, vec![record(b'x', 1)]));
             assert_eq!(buffered(&f), before);
         } else {
-            throttled(put(&f, rejected));
-            assert_eq!(buffered(&f), before);
-            // A rejected call consumed neither request, record nor byte capacity.
-            put(&f, vec![record(b'd', 4)]).unwrap();
+            assert_eq!(
+                f.engine
+                    .enqueue_put(ACCOUNT, REGION, NAME, rejected)
+                    .unwrap(),
+                vec![true, false]
+            );
+            // The request was charged once, even though its second entry failed.
+            throttled(put(&f, vec![record(b'd', 1)]));
         }
         f.advance(60);
         f.turn().await;
         let records = f.batches()[0].records.clone();
         let mut expected = vec![record(b'a', 4), record(b'b', 2), record(b'c', 2)];
         if dimension != "requests" {
-            expected.push(record(b'd', 4));
+            expected.push(record(b'x', if dimension == "records" { 1 } else { 3 }));
         }
         assert_eq!(records, expected);
     }
@@ -185,15 +194,23 @@ fn budgets_are_stream_account_region_isolated_and_concurrent() {
             7
         );
     });
-    let svc = crate::FirehoseService::default().with_engine(f.engine.clone());
     for (account, region, name) in [
         (ACCOUNT, REGION, "other"),
         ("222222222222", REGION, NAME),
         (ACCOUNT, "us-west-2", NAME),
     ] {
-        svc.deliver_records(account, region, name, vec![vec![1]; 7])
-            .unwrap();
-        throttled(svc.deliver_records(account, region, name, vec![vec![1]]));
+        assert_eq!(
+            f.engine
+                .enqueue_put(account, region, name, vec![record(b'a', 1); 7])
+                .unwrap(),
+            vec![true; 7]
+        );
+        assert_eq!(
+            f.engine
+                .enqueue_put(account, region, name, vec![record(b'x', 1)])
+                .unwrap(),
+            vec![false]
+        );
     }
 }
 
@@ -344,6 +361,99 @@ fn request(action: &str, body: serde_json::Value) -> fakecloud_core::service::Aw
 }
 
 #[tokio::test]
+async fn public_batch_burst_is_ordered_and_debt_survives_window_rollover() {
+    use fakecloud_core::service::AwsService;
+    let f = Fixture::new(60);
+    enforce(&f, None, None, Some(2.0 / 1_048_576.0));
+    let svc = crate::FirehoseService::default().with_engine(f.engine.clone());
+    let send = || {
+        request(
+            "PutRecordBatch",
+            json!({"DeliveryStreamName": NAME,
+        "Records": [{"Data": "YWJjZGU="}, {"Data": "Zg=="}, {"Data": ""}]}),
+        )
+    };
+    let response = svc.handle(send()).await.unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(response.body.expect_bytes()).unwrap();
+    assert_eq!(body["FailedPutCount"], 1);
+    assert!(body["RequestResponses"][0]["RecordId"].is_string());
+    assert_eq!(
+        body["RequestResponses"][1],
+        json!({"ErrorCode": "ServiceUnavailableException", "ErrorMessage": "Slow down."})
+    );
+    assert!(body["RequestResponses"][2]["RecordId"].is_string());
+    assert_eq!(
+        buffered(&f),
+        vec![Bytes::from_static(b"abcde"), Bytes::new()]
+    );
+
+    // Five bytes against two bytes/s leave three bytes carried at t+1.
+    // At t+2 only one byte remains charged, leaving room for the retry.
+    {
+        f.advance(1);
+        let response = svc.handle(send()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(response.body.expect_bytes()).unwrap();
+        assert_eq!(body["FailedPutCount"], 2);
+    }
+    f.advance(1);
+    let response = svc
+        .handle(request(
+            "PutRecordBatch",
+            json!({"DeliveryStreamName": NAME,
+        "Records": [{"Data": "Zg=="}]}),
+        ))
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(response.body.expect_bytes()).unwrap();
+    assert_eq!(body["FailedPutCount"], 0);
+    assert_eq!(buffered(&f).last().unwrap(), &Bytes::from_static(b"f"));
+}
+
+#[tokio::test]
+async fn malformed_base64_rejects_whole_call_without_consuming_capacity() {
+    use fakecloud_core::service::AwsService;
+    let f = Fixture::new(60);
+    enforce(&f, Some(1.0), Some(1.0), None);
+    let svc = crate::FirehoseService::default().with_engine(f.engine.clone());
+    for (action, body) in [
+        (
+            "PutRecord",
+            json!({"DeliveryStreamName": NAME, "Record": {"Data": "%%%"}}),
+        ),
+        (
+            "PutRecordBatch",
+            json!({"DeliveryStreamName": NAME, "Records": [{"Data": "YQ=="}, {"Data": "%%%"}]}),
+        ),
+    ] {
+        let error = svc.handle(request(action, body)).await.err().unwrap();
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.code(), "SerializationException");
+        assert!(buffered(&f).is_empty());
+    }
+    svc.handle(request(
+        "PutRecord",
+        json!({"DeliveryStreamName": NAME,
+        "Record": {"Data": "Yg=="}}),
+    ))
+    .await
+    .unwrap();
+    let error = svc
+        .handle(request(
+            "PutRecordBatch",
+            json!({"DeliveryStreamName": NAME,
+        "Records": [{"Data": "Yw=="}]}),
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error.code(), "ServiceUnavailableException");
+    assert_eq!(error.message(), "Slow down.");
+    assert_eq!(buffered(&f), vec![Bytes::from_static(b"b")]);
+}
+
+#[tokio::test]
 async fn public_decoding_charges_only_valid_records_and_decoded_bytes() {
     use fakecloud_core::service::AwsService;
     let f = Fixture::new(60);
@@ -359,12 +469,12 @@ async fn public_decoding_charges_only_valid_records_and_decoded_bytes() {
         .handle(request(
             "PutRecordBatch",
             json!({"DeliveryStreamName": NAME,
-        "Records": [{"Data": "%%%"}, {"Data": "YmNk"}]}),
+        "Records": [{"Data": "YmNk"}]}),
         ))
         .await
         .unwrap();
     let body: serde_json::Value = serde_json::from_slice(response.body.expect_bytes()).unwrap();
-    assert_eq!(body["FailedPutCount"], 1);
+    assert_eq!(body["FailedPutCount"], 0);
     let error = svc
         .handle(request(
             "PutRecord",
@@ -392,10 +502,6 @@ async fn public_request_validation_never_debits_or_partially_admits() {
     let svc = crate::FirehoseService::default().with_engine(f.engine.clone());
     let oversized = base64::engine::general_purpose::STANDARD.encode(vec![0; 1_024_001]);
     for (action, body) in [
-        (
-            "PutRecord",
-            json!({"DeliveryStreamName": NAME, "Record": {"Data": "%%%"}}),
-        ),
         (
             "PutRecord",
             json!({"DeliveryStreamName": NAME, "Record": {"Data": oversized}}),
@@ -440,14 +546,14 @@ async fn public_request_validation_never_debits_or_partially_admits() {
 }
 
 #[tokio::test]
-async fn all_invalid_public_batch_consumes_one_request_but_no_records() {
+async fn all_throttled_public_batch_consumes_one_request_but_no_records() {
     use fakecloud_core::service::AwsService;
     let f = Fixture::new(60);
     enforce(&f, Some(1.0), Some(0.0), Some(0.0));
     let svc = crate::FirehoseService::default().with_engine(f.engine.clone());
     svc.handle(request(
         "PutRecordBatch",
-        json!({"DeliveryStreamName": NAME, "Records": [{"Data": "%%%"}]}),
+        json!({"DeliveryStreamName": NAME, "Records": [{"Data": "YQ=="}]}),
     ))
     .await
     .unwrap();

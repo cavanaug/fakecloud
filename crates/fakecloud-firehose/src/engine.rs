@@ -242,6 +242,7 @@ impl FirehoseEngine {
         records: Vec<Bytes>,
     ) -> Result<(), AwsServiceError> {
         self.enqueue_admission(account, region, name, records, None)
+            .map(|_| ())
     }
 
     pub(crate) fn enqueue_put(
@@ -250,18 +251,26 @@ impl FirehoseEngine {
         region: &str,
         name: &str,
         records: Vec<Bytes>,
-    ) -> Result<(), AwsServiceError> {
+    ) -> Result<Vec<bool>, AwsServiceError> {
         // Provider implementations can consult other services (including
         // Firehose). Release even the provider guard before resolving limits,
         // and never call them under configuration or registry locks.
         let provider = self.core.quota_provider.read().clone();
         let limits = provider.map(|provider| {
-            let limit =
-                |code| provider.enforced_limit(account, region, FIREHOSE_SERVICE_CODE, code);
+            let values = provider.enforced_limits(
+                account,
+                region,
+                FIREHOSE_SERVICE_CODE,
+                &[
+                    FIREHOSE_PUT_REQUESTS_PER_SECOND,
+                    FIREHOSE_RECORDS_PER_SECOND,
+                    FIREHOSE_MIB_PER_SECOND,
+                ],
+            );
             ThroughputLimits {
-                requests: limit(FIREHOSE_PUT_REQUESTS_PER_SECOND),
-                records: limit(FIREHOSE_RECORDS_PER_SECOND),
-                mib: limit(FIREHOSE_MIB_PER_SECOND),
+                requests: values[0],
+                records: values[1],
+                mib: values[2],
             }
         });
         let limits =
@@ -276,7 +285,7 @@ impl FirehoseEngine {
         name: &str,
         records: Vec<Bytes>,
         limits: Option<ThroughputLimits>,
-    ) -> Result<(), AwsServiceError> {
+    ) -> Result<Vec<bool>, AwsServiceError> {
         // Every path holding both takes configuration before the registry. Keep
         // the read guard until admission and immediate detachment both commit.
         let config = self.core.state.read();
@@ -317,34 +326,35 @@ impl FirehoseEngine {
             instance_id: stream.instance_id,
         };
         let now = self.core.clock.now();
+        let mut accepted = vec![true; records.len()];
         if let Some(limits) = limits {
-            let bytes = records.iter().map(Bytes::len).sum();
-            if !registry
+            let window = registry
                 .windows
                 .entry(key.clone())
-                .or_insert_with(|| ThroughputWindow::new(now.monotonic))
-                .try_admit(now.monotonic, limits, records.len(), bytes)
-            {
-                return Err(AwsServiceError::aws_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "ServiceUnavailableException",
-                    "Throughput limit exceeded for the delivery stream. Back off and retry.",
-                ));
+                .or_insert_with(|| ThroughputWindow::new(now.monotonic));
+            if !window.try_request(now.monotonic, limits) {
+                return Err(throughput_error());
+            }
+            for (admitted, record) in accepted.iter_mut().zip(&records) {
+                *admitted = window.try_record(limits, record.len());
             }
         }
         // Non-S3 streams retain the configuration-only acknowledgement, but
         // public ingestion is still metered even without an S3 backend.
         let Some(destination) = destination else {
-            return Ok(());
+            return Ok(accepted);
         };
         let buffer = registry.streams.entry(key.clone()).or_default();
-        if !records.is_empty() {
+        if accepted.iter().any(|admitted| *admitted) {
             let active = buffer.active.get_or_insert_with(|| ActiveBuffer {
                 records: Vec::new(),
                 input_bytes: 0,
                 first: now.clone(),
             });
-            for record in records {
+            for (record, admitted) in records.into_iter().zip(&accepted) {
+                if !admitted {
+                    continue;
+                }
                 active.input_bytes += record.len();
                 active.records.push(record);
             }
@@ -358,7 +368,7 @@ impl FirehoseEngine {
         drop(registry);
         drop(config);
         self.core.wake.notify_one();
-        Ok(())
+        Ok(accepted)
     }
 
     /// Start once inside an active Tokio runtime. Admission can precede startup.
@@ -718,6 +728,14 @@ impl EngineCore {
 /// The one delivery decision shared by admission, scheduling, and the final
 /// drain, so they cannot disagree about whether a stream can deliver.
 /// `Ok(None)`: no destination is configured, so nothing is written.
+pub(crate) fn throughput_error() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "ServiceUnavailableException",
+        "Slow down.",
+    )
+}
+
 fn stream_delivery(stream: &DeliveryStream) -> Result<Option<DeliveryConfig>, AwsServiceError> {
     crate::admission::validate_stream_destination(stream)?;
     stream.destination.as_ref().map(delivery_config).transpose()

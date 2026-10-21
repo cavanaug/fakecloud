@@ -835,7 +835,7 @@ impl FirehoseService {
             .map_err(|_| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
-                    "InvalidArgumentException",
+                    "SerializationException",
                     "Record.Data must be valid base64",
                 )
             })?;
@@ -845,7 +845,15 @@ impl FirehoseService {
             ));
         }
         let record_id = format!("{}", Uuid::new_v4());
-        self.deliver_records(&req.account_id, &req.region, &name, vec![data])?;
+        let accepted = self.engine.enqueue_put(
+            &req.account_id,
+            &req.region,
+            &name,
+            vec![Bytes::from(data)],
+        )?;
+        if !accepted[0] {
+            return Err(crate::engine::throughput_error());
+        }
         Ok(AwsResponse::ok_json(json!({
             "RecordId": record_id,
             "Encrypted": false,
@@ -867,8 +875,6 @@ impl FirehoseService {
             ));
         }
         let mut datas = Vec::with_capacity(records.len());
-        let mut response_records = Vec::with_capacity(records.len());
-        let mut failed = 0;
         let mut decoded_bytes = 0;
         for r in records {
             let b64 = r["Data"].as_str();
@@ -883,23 +889,30 @@ impl FirehoseService {
                     if decoded_bytes > 4_194_304 {
                         return Err(invalid_argument("Records exceed 4,194,304 decoded bytes"));
                     }
-                    datas.push(data);
-                    response_records.push(json!({
-                        "RecordId": Uuid::new_v4().to_string(),
-                    }));
+                    datas.push(Bytes::from(data));
                 }
                 _ => {
-                    failed += 1;
-                    response_records.push(json!({
-                        "ErrorCode": "InvalidArgumentException",
-                        "ErrorMessage": "Record.Data must be a base64-encoded string",
-                    }));
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "SerializationException",
+                        "Record.Data must be a base64-encoded string",
+                    ));
                 }
             }
         }
         // One handoff after all decoding/limits: request-wide rejection cannot
-        // partially admit data. Empty/all-invalid requests still run preflight.
-        self.deliver_records(&req.account_id, &req.region, &name, datas)?;
+        // partially admit data. Only throughput refusal can fail individual entries.
+        let accepted = self
+            .engine
+            .enqueue_put(&req.account_id, &req.region, &name, datas)?;
+        let failed = accepted.iter().filter(|admitted| !**admitted).count();
+        let response_records: Vec<_> = accepted.into_iter().map(|admitted| {
+            if admitted {
+                json!({"RecordId": Uuid::new_v4().to_string()})
+            } else {
+                json!({"ErrorCode": "ServiceUnavailableException", "ErrorMessage": "Slow down."})
+            }
+        }).collect();
         Ok(AwsResponse::ok_json(json!({
             "FailedPutCount": failed,
             "Encrypted": false,
@@ -1138,6 +1151,8 @@ impl FirehoseService {
         Ok(AwsResponse::ok_json(json!({})))
     }
 
+    /// Internal decoded-record handoff, unmetered like the Logs/SES adapters.
+    /// Public Direct PUT APIs use the engine's quota-aware admission instead.
     pub fn deliver_records(
         &self,
         account_id: &str,
@@ -1145,7 +1160,7 @@ impl FirehoseService {
         stream_name: &str,
         datas: Vec<Vec<u8>>,
     ) -> Result<(), AwsServiceError> {
-        self.engine.enqueue_put(
+        self.engine.enqueue(
             account_id,
             region,
             stream_name,
@@ -1234,8 +1249,8 @@ mod tests {
                 }
                 for records in [
                     json!([]),
-                    json!([{"Data": "%%%"}]),
-                    json!([{"Data": "eA=="}, {"Data": "%%%"}]),
+                    json!([{"Data": ""}]),
+                    json!([{"Data": "eA=="}, {"Data": ""}]),
                 ] {
                     let empty = records.as_array().unwrap().is_empty();
                     let error = svc
@@ -2562,26 +2577,15 @@ mod tests {
     }
 
     #[test]
-    fn task5_empty_and_malformed_batch_entry_order() {
+    fn malformed_batch_is_request_wide_even_after_valid_or_empty_records() {
         let (svc, _) = memory_fixture();
-        let response = batch(
-            &svc,
-            vec![
-                json!({"Data": "%%%"}),
-                record(b""),
-                record(b"valid"),
-                json!({}),
-            ],
-        )
-        .unwrap();
-        let response: Value = serde_json::from_slice(response.body.expect_bytes()).unwrap();
-        assert_eq!(response["FailedPutCount"], 2);
-        let entries = response["RequestResponses"].as_array().unwrap();
-        assert_eq!(entries.len(), 4);
-        assert_eq!(entries[0]["ErrorCode"], "InvalidArgumentException");
-        assert!(entries[1]["RecordId"].as_str().is_some());
-        assert!(entries[2]["RecordId"].as_str().is_some());
-        assert_eq!(entries[3]["ErrorCode"], "InvalidArgumentException");
+        for malformed in [json!({"Data": "%%%"}), json!({}), json!({"Data": 1})] {
+            let error = batch(&svc, vec![record(b""), record(b"valid"), malformed])
+                .err()
+                .unwrap();
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(error.code(), "SerializationException");
+        }
         let error = svc
             .put_record_batch(&request(
                 "PutRecordBatch",
@@ -2591,7 +2595,7 @@ mod tests {
             ))
             .err()
             .unwrap();
-        assert_eq!(error.code(), "ResourceNotFoundException");
+        assert_eq!(error.code(), "SerializationException");
     }
 
     #[tokio::test]
@@ -2831,13 +2835,11 @@ mod tests {
         let (svc, s3) = memory_fixture();
         let mut exact = exact;
         exact.push(record(&vec![2; 98_304]));
-        // Malformed entries are not included in the decoded-byte sum.
-        exact.insert(0, json!({"Data": "%%%"}));
         let response = batch(&svc, exact).unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(response.body.expect_bytes()).unwrap()
                 ["FailedPutCount"],
-            1
+            0
         );
         assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
         let s3 = s3.read();
@@ -2847,7 +2849,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_batch_admits_only_valid_bytes_and_empty_blobs_create_no_objects() {
+    async fn malformed_batch_admits_nothing_and_empty_blobs_create_no_objects() {
         let (svc, s3) = memory_fixture();
         batch(
             &svc,
@@ -2859,17 +2861,13 @@ mod tests {
                 record(b"b"),
             ],
         )
-        .unwrap();
-        assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
+        .err()
+        .expect("malformed batch must reject");
+        assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 0);
         let objects = s3.read().get(S3_ACCOUNT).unwrap().buckets["buffered"]
             .objects
             .clone();
-        assert_eq!(objects.len(), 1);
-        let fakecloud_persistence::BodyRef::Memory(body) = &objects.values().next().unwrap().body
-        else {
-            panic!("memory fixture")
-        };
-        assert_eq!(body.as_ref(), b"ab");
+        assert!(objects.is_empty());
         let (svc, s3) = memory_fixture();
         put(&svc, b"").unwrap();
         let response = batch(&svc, vec![record(b""); 500]).unwrap();
@@ -2898,7 +2896,7 @@ mod tests {
         for result in [
             put(&svc, b"late"),
             batch(&svc, vec![record(b"late")]),
-            batch(&svc, vec![json!({"Data": "%%%"})]),
+            batch(&svc, vec![record(b"")]),
         ] {
             let error = result.err().unwrap();
             assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -3277,7 +3275,7 @@ mod tests {
 
         for records in [
             json!([{ "Data": "eA==" }]),
-            json!([{ "Data": "eA==" }, { "Data": "@@@" }]),
+            json!([{ "Data": "eA==" }, { "Data": "" }]),
         ] {
             assert_source_rejected(
                 svc.put_record_batch(&request(
@@ -3300,8 +3298,8 @@ mod tests {
         ))
         .unwrap();
 
-        // Empty arrays fail the request-wide 1-500 entry check; malformed or
-        // empty blobs in a nonempty array must still run source admission.
+        // Empty arrays fail the request-wide 1-500 entry check; valid empty
+        // blobs in a nonempty array must still run source admission.
         let err = svc
             .put_record_batch(&request(
                 "PutRecordBatch",
@@ -3312,7 +3310,10 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.code(), "InvalidArgumentException");
-        for records in [json!([{ "Data": "@@@" }, {}]), json!([{ "Data": "" }])] {
+        for records in [
+            json!([{ "Data": "" }, {"Data": ""}]),
+            json!([{ "Data": "" }]),
+        ] {
             assert_source_rejected(
                 svc.put_record_batch(&request(
                     "PutRecordBatch",
@@ -3468,7 +3469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_put_record_and_batch_keep_success_and_partial_failure_behavior() {
+    async fn direct_put_record_succeeds_and_malformed_batches_do_not_deliver() {
         let (svc, s3_state, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
         create_s3_stream(&svc, "direct-stream", "fh-bucket");
         let resp = svc
@@ -3478,33 +3479,19 @@ mod tests {
         let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
         assert!(!body["RecordId"].as_str().unwrap().is_empty());
 
-        for (records, failed) in [
-            (json!([{ "Data": "eA==" }, { "Data": "@@@" }]), 1),
-            (json!([{ "Data": "@@@" }]), 1),
+        for records in [
+            json!([{ "Data": "eA==" }, { "Data": "@@@" }]),
+            json!([{ "Data": "@@@" }]),
         ] {
-            let resp = svc
+            let error = svc
                 .put_record_batch(&request(
                     "PutRecordBatch",
                     json!({ "DeliveryStreamName": "direct-stream", "Records": records }),
                 ))
+                .err()
                 .unwrap();
-            assert_eq!(resp.status, StatusCode::OK);
-            let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
-            assert_eq!(body["FailedPutCount"], failed);
-            assert_eq!(
-                body["RequestResponses"].as_array().unwrap().len(),
-                records.as_array().unwrap().len()
-            );
-            if records.as_array().unwrap().len() == 2 {
-                assert!(!body["RequestResponses"][0]["RecordId"]
-                    .as_str()
-                    .unwrap()
-                    .is_empty());
-                assert_eq!(
-                    body["RequestResponses"][1]["ErrorCode"],
-                    "InvalidArgumentException"
-                );
-            }
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(error.code(), "SerializationException");
         }
         assert_eq!(svc.delivery_engine().shutdown().await.delivered_batches, 1);
         let s3 = s3_state.read();
@@ -3522,7 +3509,7 @@ mod tests {
                 .next()
                 .unwrap()
                 .size,
-            2
+            1
         );
     }
 

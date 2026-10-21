@@ -1,12 +1,13 @@
 //! Public Firehose admission contract, using real HTTP and the official AWS SDK.
-//! Fixed-window refill/concurrency are covered by the deterministic engine tests;
-//! these tests use impossible single-call costs or zero capacity, not clock races.
+//! Burst repayment/concurrency are covered by deterministic engine tests;
+//! HTTP assertions use single-call costs or zero capacity, not clock races.
 
 use std::future::Future;
 use std::io::Read;
 use std::time::Duration;
 
 use aws_sdk_firehose::config::retry::RetryConfig;
+use aws_sdk_firehose::error::ProvideErrorMetadata;
 use aws_sdk_firehose::error::SdkError;
 use aws_sdk_firehose::operation::put_record::PutRecordError;
 use aws_sdk_firehose::operation::put_record_batch::PutRecordBatchError;
@@ -125,6 +126,7 @@ fn assert_single_unavailable(err: SdkError<PutRecordError>) {
         panic!("expected modeled PutRecord service error, got {err:?}");
     };
     assert_eq!(context.raw().status().as_u16(), 500);
+    assert_eq!(context.err().message(), Some("Slow down."));
     assert!(
         matches!(
             context.err(),
@@ -140,6 +142,7 @@ fn assert_batch_unavailable(err: SdkError<PutRecordBatchError>) {
         panic!("expected modeled PutRecordBatch service error, got {err:?}");
     };
     assert_eq!(context.raw().status().as_u16(), 500);
+    assert_eq!(context.err().message(), Some("Slow down."));
     assert!(
         matches!(
             context.err(),
@@ -283,36 +286,86 @@ async fn zero_request_capacity_returns_modeled_http_500_for_both_apis_then_live_
 }
 
 #[tokio::test]
-async fn record_capacity_rejects_entire_batch_without_s3_side_effects_then_live_raise_delivers() {
+async fn record_capacity_partially_accepts_batch_and_only_failed_entries_are_resubmitted() {
     bounded(async {
         let server = TestServer::start().await;
         let bucket = "fh-throughput-records";
         let (firehose, s3) = setup(&server, bucket, false).await;
         let fc = FakeCloud::new(server.endpoint());
         limit(&fc, RECORDS, 1.0).await;
-        assert_batch_unavailable(
-            firehose
-                .put_record_batch()
-                .delivery_stream_name(bucket)
-                .records(record(b"first"))
-                .records(record(b"second"))
-                .send()
-                .await
-                .expect_err("two records cannot fit in capacity one"),
-        );
-        assert_no_objects(&s3, bucket).await;
-        limit(&fc, RECORDS, 2.0).await;
-        batch(&firehose, bucket, vec![record(b"first"), record(b"second")]).await;
+        let response = firehose
+            .put_record_batch()
+            .delivery_stream_name(bucket)
+            .records(record(b"first"))
+            .records(record(b"second"))
+            .send()
+            .await
+            .expect("record exhaustion returns HTTP 200");
+        assert_eq!(response.failed_put_count(), 1);
+        let entries = response.request_responses();
+        assert!(entries[0].record_id().is_some());
+        assert!(entries[0].error_code().is_none());
+        assert!(entries[1].record_id().is_none());
+        assert_eq!(entries[1].error_code(), Some("ServiceUnavailableException"));
+        assert_eq!(entries[1].error_message(), Some("Slow down."));
         assert_eq!(
             payloads(&s3, bucket, 1, false).await,
-            vec![b"firstsecond".to_vec()]
+            vec![b"first".to_vec()]
+        );
+        // A successful batch response does not cause SDK retries of failed
+        // entries. The producer explicitly resubmits only that entry.
+        limit(&fc, RECORDS, 2.0).await;
+        batch(&firehose, bucket, vec![record(b"second")]).await;
+        assert_eq!(
+            payloads(&s3, bucket, 2, false).await,
+            vec![b"first".to_vec(), b"second".to_vec()]
         );
     })
     .await;
 }
 
 #[tokio::test]
-async fn byte_capacity_counts_decoded_raw_bytes_not_base64_or_gzip_and_rejects_whole_batch() {
+async fn zero_record_or_byte_capacity_fails_single_calls_but_returns_all_failed_batches() {
+    bounded(async {
+        for (code, bucket) in [
+            (RECORDS, "fh-throughput-zero-records"),
+            (MIB, "fh-throughput-zero-bytes"),
+        ] {
+            let server = TestServer::start().await;
+            let (firehose, s3) = setup(&server, bucket, false).await;
+            limit(&FakeCloud::new(server.endpoint()), code, 0.0).await;
+            assert_single_unavailable(
+                firehose
+                    .put_record()
+                    .delivery_stream_name(bucket)
+                    .record(record(b"single"))
+                    .send()
+                    .await
+                    .unwrap_err(),
+            );
+            let response = firehose
+                .put_record_batch()
+                .delivery_stream_name(bucket)
+                .records(record(b"first"))
+                .records(record(b"second"))
+                .send()
+                .await
+                .expect("record/byte limits must not reject a batch as a whole-call error");
+            assert_eq!(response.failed_put_count(), 2);
+            assert_eq!(response.request_responses().len(), 2);
+            for entry in response.request_responses() {
+                assert!(entry.record_id().is_none());
+                assert_eq!(entry.error_code(), Some("ServiceUnavailableException"));
+                assert_eq!(entry.error_message(), Some("Slow down."));
+            }
+            assert_no_objects(&s3, bucket).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn byte_capacity_counts_decoded_bytes_and_admits_one_boundary_crossing_record() {
     bounded(async {
         let server = TestServer::start().await;
         let bucket = "fh-throughput-bytes";
@@ -320,23 +373,27 @@ async fn byte_capacity_counts_decoded_raw_bytes_not_base64_or_gzip_and_rejects_w
         let fc = FakeCloud::new(server.endpoint());
         let a = vec![b'a'; 4096];
         let b = vec![b'b'; 4096];
-        // Each individual record fits in 6144 bytes, but the 8192-byte batch does not.
-        // GZIP output is tiny; base64 on the wire is larger than either capacity.
-        limit(&fc, MIB, 6144.0 / 1_048_576.0).await;
-        assert_batch_unavailable(
-            firehose
-                .put_record_batch()
-                .delivery_stream_name(bucket)
-                .records(record(&a))
-                .records(record(&b))
-                .send()
-                .await
-                .expect_err("raw decoded batch exceeds byte capacity"),
+        // The first 4096-byte record crosses 3072 bytes of capacity. Its base64
+        // encoding is larger and GZIP output is tiny; neither sets the budget.
+        limit(&fc, MIB, 3072.0 / 1_048_576.0).await;
+        let response = firehose
+            .put_record_batch()
+            .delivery_stream_name(bucket)
+            .records(record(&a))
+            .records(record(&b))
+            .send()
+            .await
+            .expect("byte exhaustion is per-entry");
+        assert_eq!(response.failed_put_count(), 1);
+        assert!(response.request_responses()[0].record_id().is_some());
+        assert_eq!(
+            response.request_responses()[1].error_code(),
+            Some("ServiceUnavailableException")
         );
-        assert_no_objects(&s3, bucket).await;
+        assert_eq!(payloads(&s3, bucket, 1, true).await, vec![a.clone()]);
         limit(&fc, MIB, 8192.0 / 1_048_576.0).await;
-        batch(&firehose, bucket, vec![record(&a), record(&b)]).await;
-        assert_eq!(payloads(&s3, bucket, 1, true).await, vec![[a, b].concat()]);
+        batch(&firehose, bucket, vec![record(&b)]).await;
+        assert_eq!(payloads(&s3, bucket, 2, true).await, vec![a, b]);
     })
     .await;
 }
@@ -406,6 +463,175 @@ async fn configured_zero_values_are_not_enforced_by_default() {
         assert_eq!(
             payloads(&s3, bucket, 2, false).await,
             vec![b"batch".to_vec(), b"single".to_vec()]
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn enabling_default_throughput_does_not_impose_the_reported_aws_limit() {
+    bounded(async {
+        let server = TestServer::start_full(&[], &["--enforce-quotas"]).await;
+        let region = "us-east-2"; // Reported default is 1 MiB/s.
+        let firehose = client(&server.aws_config_in(region).await, 1);
+        let fc = FakeCloud::new(server.endpoint());
+        let quotas = fc
+            .service_quotas()
+            .get_quotas(None, Some(region), Some("firehose"))
+            .await
+            .unwrap();
+        for quota in quotas
+            .quotas
+            .iter()
+            .filter(|q| [REQUESTS, RECORDS, MIB].contains(&q.quota_code.as_str()))
+        {
+            assert!(!quota.enforced);
+            assert_eq!(quota.enforcement_source, "auto_scaling_default");
+        }
+        create_stream(
+            &firehose,
+            "default-throughput",
+            "unused-default-bucket",
+            false,
+        )
+        .await;
+        // Several maximum-size batches exceed the AWS default without explicit
+        // applied values. Limits alone must not introduce failed entries.
+        let bytes = vec![b'x'; 800_000];
+        for _ in 0..3 {
+            batch(&firehose, "default-throughput", vec![record(&bytes); 5]).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn same_named_streams_in_two_enforced_accounts_each_get_their_own_allowance() {
+    bounded(async {
+        let server = TestServer::start().await;
+        let bucket = "fh-throughput-two-accounts";
+        let (firehose, s3) = setup(&server, bucket, false).await;
+        let fc = FakeCloud::new(server.endpoint());
+        limit(&fc, RECORDS, 1.0).await;
+        let other = "210987654321";
+        let (access, secret) = server.create_admin(other, "throughput-account").await;
+        let sdk = server
+            .aws_config_in(REGION)
+            .await
+            .into_builder()
+            .credentials_provider(
+                aws_credential_types::provider::SharedCredentialsProvider::new(
+                    aws_credential_types::Credentials::new(access, secret, None, None, "test"),
+                ),
+            )
+            .build();
+        let other_firehose = client(&sdk, 1);
+        let other_s3 = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::from(&sdk)
+                .force_path_style(true)
+                .build(),
+        );
+        let other_bucket = "fh-throughput-other-account";
+        other_s3
+            .create_bucket()
+            .bucket(other_bucket)
+            .create_bucket_configuration(
+                aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                    .location_constraint(aws_sdk_s3::types::BucketLocationConstraint::UsWest2)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        create_stream(&other_firehose, bucket, other_bucket, false).await;
+        fc.service_quotas()
+            .put_quota(
+                "firehose",
+                RECORDS,
+                &PutServiceQuotaRequest {
+                    account_id: Some(other.into()),
+                    region: Some(REGION.into()),
+                    value: Some(1.0),
+                    enforce: Some(QuotaEnforcement::Enforce),
+                },
+            )
+            .await
+            .unwrap();
+        for (producer, accepted, rejected) in [
+            (
+                &firehose,
+                b"first-account".as_slice(),
+                b"reject-first".as_slice(),
+            ),
+            (
+                &other_firehose,
+                b"second-account".as_slice(),
+                b"reject-second".as_slice(),
+            ),
+        ] {
+            let response = producer
+                .put_record_batch()
+                .delivery_stream_name(bucket)
+                .records(record(accepted))
+                .records(record(rejected))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.failed_put_count(), 1);
+            assert!(response.request_responses()[0].record_id().is_some());
+            assert_eq!(
+                response.request_responses()[1].error_code(),
+                Some("ServiceUnavailableException")
+            );
+        }
+        assert_eq!(
+            payloads(&s3, bucket, 1, false).await,
+            vec![b"first-account".to_vec()]
+        );
+        assert_eq!(
+            payloads(&other_s3, other_bucket, 1, false).await,
+            vec![b"second-account".to_vec()]
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn decoded_byte_budget_excludes_base64_and_compression() {
+    bounded(async {
+        let server = TestServer::start().await;
+        let bucket = "fh-throughput-decoded";
+        let (firehose, s3) = setup(&server, bucket, true).await;
+        limit(
+            &FakeCloud::new(server.endpoint()),
+            MIB,
+            8192.0 / 1_048_576.0,
+        )
+        .await;
+        let a = vec![b'a'; 4096];
+        let b = vec![b'b'; 2048];
+        let c = vec![b'c'; 2048];
+        let response = firehose
+            .put_record_batch()
+            .delivery_stream_name(bucket)
+            .records(record(&a))
+            .records(record(&b))
+            .records(record(&c))
+            .records(record(b"d"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.failed_put_count(), 1);
+        assert!(response.request_responses()[..3]
+            .iter()
+            .all(|r| r.record_id().is_some()));
+        assert_eq!(
+            response.request_responses()[3].error_code(),
+            Some("ServiceUnavailableException")
+        );
+        assert_eq!(
+            payloads(&s3, bucket, 1, true).await,
+            vec![[a, b, c].concat()]
         );
     })
     .await;
