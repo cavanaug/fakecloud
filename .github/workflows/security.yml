@@ -73,11 +73,6 @@ jobs:
       # constant-time fix yet. The same advisory is the standard escape hatch
       # for any project that needs RSA in pure Rust today.
       #
-      # RUSTSEC-2026-0185 (backoff is unmaintained) reaches us only transitively
-      # through kube-runtime's retry/backoff timers. It is an unmaintained-crate
-      # advisory, not an exploitable vulnerability; backoff computes retry delays
-      # and handles no untrusted input. No action until kube drops the dependency.
-      #
       # RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (quick-xml <0.41: quadratic
       # duplicate-attribute check + unbounded namespace-declaration allocation)
       # are algorithmic-complexity / memory DoS reachable only by feeding the
@@ -94,27 +89,27 @@ jobs:
       # PR and main until an upstream fix lands; ignored with the same policy as
       # the entries above.
       #
-      # RUSTSEC-2024-0384 (paste), RUSTSEC-2024-0436 (proc-macro-error2) and
-      # RUSTSEC-2025-0012 (derivative) are unmaintained proc-macro / derive
-      # helpers used only at build time; they never touch runtime input.
+      # RUSTSEC-2024-0384 (instant), RUSTSEC-2024-0388 (derivative),
+      # RUSTSEC-2025-0012 (backoff) and RUSTSEC-2025-0134 (rustls-pemfile) are
+      # unmaintained-crate advisories reached only through kube 0.95
+      # (kube-runtime's retry/backoff timers and derives, kube-client's
+      # kubeconfig PEM loading). They compute delays or parse the operator's
+      # own kubeconfig material, never attacker-controlled input; no action
+      # until kube drops them.
       #
-      # RUSTSEC-2024-0388 (instant) and RUSTSEC-2026-0235 (backoff) are
-      # unmaintained crates reached transitively through the async / kube retry
-      # stack (same reachability as RUSTSEC-2026-0185 above): timers and delay
-      # math over no untrusted input.
+      # RUSTSEC-2024-0436 (paste unmaintained) is a build-time proc-macro
+      # helper pulled by boa_engine (CloudFront Functions); it never touches
+      # runtime input.
       #
-      # RUSTSEC-2026-0173 (rustls-pemfile unmaintained) parses only the
-      # emulator's own trusted PEM material, never attacker-supplied files.
+      # RUSTSEC-2026-0190 (anyhow Error::downcast_mut unsoundness) and
+      # RUSTSEC-2026-0235 (rkyv 0.7 archive validation) only appear in
+      # Cargo.lock as dependencies of features we do not enable (the
+      # wit-bindgen / wasm-metadata tooling, rust_decimal's rkyv support);
+      # neither is compiled into any fakecloud target.
       #
-      # RUSTSEC-2025-0134 (anyhow Error::downcast_mut unsoundness) and
-      # RUSTSEC-2026-0190 (event-listener !Send StackSlot unsoundness) reach us
-      # transitively; fakecloud does not exercise the unsound APIs (we never call
-      # anyhow's downcast_mut, nor cross a thread boundary with a !Send listener
-      # tag) and neither advisory has a fixed release on our pinned versions yet.
-      #
-      # RUSTSEC-2026-0221 (spin 0.9.8 yanked) is a yanked transitive spinlock
-      # dependency; nothing in fakecloud's tree can move off it until upstream
-      # crates republish.
+      # RUSTSEC-2026-0221 (event-listener !Send StackSlot unsoundness) reaches
+      # us via kube-runtime's async-broadcast; fakecloud never moves a !Send
+      # listener tag across threads, and no fixed 5.x release exists yet.
       #
       # RUSTSEC-2026-0258 (h2 unbounded empty DATA frames) is fixed on the 0.4
       # line (bumped to 0.4.16) but still reaches us via the legacy h2 0.3.x that
@@ -149,7 +144,6 @@ jobs:
             --ignore RUSTSEC-2026-0104 \
             --ignore RUSTSEC-2026-0097 \
             --ignore RUSTSEC-2023-0071 \
-            --ignore RUSTSEC-2026-0185 \
             --ignore RUSTSEC-2026-0194 \
             --ignore RUSTSEC-2026-0195 \
             --ignore RUSTSEC-2024-0384 \
@@ -157,7 +151,6 @@ jobs:
             --ignore RUSTSEC-2024-0436 \
             --ignore RUSTSEC-2025-0012 \
             --ignore RUSTSEC-2025-0134 \
-            --ignore RUSTSEC-2026-0173 \
             --ignore RUSTSEC-2026-0190 \
             --ignore RUSTSEC-2026-0221 \
             --ignore RUSTSEC-2026-0235 \
