@@ -24,7 +24,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{self, QuotaDef};
-use crate::state::{write_applied_key, ServiceQuotasData};
+use crate::state::{applied_key, ServiceQuotasData};
 
 /// How `RequestServiceQuotaIncrease` (and template entries applied to new
 /// accounts) are decided.
@@ -110,14 +110,7 @@ pub fn quota_ref(def: &QuotaDef) -> String {
 
 /// [`quota_ref`] from the codes.
 pub fn quota_ref_of(service_code: &str, quota_code: &str) -> String {
-    let mut key = String::new();
-    write_quota_ref(&mut key, service_code, quota_code);
-    key
-}
-
-fn write_quota_ref(buf: &mut String, service_code: &str, quota_code: &str) {
-    buf.clear();
-    buf.extend([service_code, "/", quota_code]);
+    format!("{service_code}/{quota_code}")
 }
 
 /// Resolve a `service_code/quota_code` reference to an enforceable quota (as
@@ -155,13 +148,11 @@ pub fn enforcement(
 /// Effective enforcement for one account in one region, read from one
 /// settings and state snapshot: the single place both the
 /// [`fakecloud_core::quota::QuotaProvider`] and the introspection view decide
-/// whether a quota is enforced. Lookups reuse one key buffer, so resolving
-/// several quotas allocates at most once.
+/// whether a quota is enforced.
 pub struct AccountEnforcement<'a> {
     settings: &'a QuotaSettings,
     data: Option<&'a ServiceQuotasData>,
     region: &'a str,
-    key: String,
 }
 
 impl<'a> AccountEnforcement<'a> {
@@ -174,7 +165,6 @@ impl<'a> AccountEnforcement<'a> {
             settings,
             data,
             region,
-            key: String::new(),
         }
     }
 
@@ -184,7 +174,7 @@ impl<'a> AccountEnforcement<'a> {
     /// the account set explicitly for the region. The catalog is decoded only
     /// for such a quota once it is switched on, so the request path of a
     /// service that enforces nothing stays cheap.
-    pub fn of(&mut self, service_code: &str, quota_code: &str) -> (bool, EnforcementSource) {
+    pub fn of(&self, service_code: &str, quota_code: &str) -> (bool, EnforcementSource) {
         if !catalog::is_enforceable(service_code, quota_code) {
             return (false, EnforcementSource::NotEnforceable);
         }
@@ -202,7 +192,7 @@ impl<'a> AccountEnforcement<'a> {
 
     /// The limit fakecloud enforces for `service_code/quota_code`: its
     /// applied value while [`AccountEnforcement::of`] says it is enforced.
-    pub fn limit(&mut self, service_code: &str, quota_code: &str) -> Option<f64> {
+    pub fn limit(&self, service_code: &str, quota_code: &str) -> Option<f64> {
         if !self.of(service_code, quota_code).0 {
             return None;
         }
@@ -215,13 +205,12 @@ impl<'a> AccountEnforcement<'a> {
 
     /// The account switch, else the server-wide override, else the global
     /// switch.
-    fn switch(&mut self, service_code: &str, quota_code: &str) -> (bool, EnforcementSource) {
-        write_quota_ref(&mut self.key, service_code, quota_code);
-        let key = self.key.as_str();
-        if let Some(on) = self.data.and_then(|d| d.enforcement.get(key)) {
+    fn switch(&self, service_code: &str, quota_code: &str) -> (bool, EnforcementSource) {
+        let key = quota_ref_of(service_code, quota_code);
+        if let Some(on) = self.data.and_then(|d| d.enforcement.get(&key)) {
             return (*on, EnforcementSource::AccountOverride);
         }
-        if let Some(on) = self.settings.overrides.get(key) {
+        if let Some(on) = self.settings.overrides.get(&key) {
             return (*on, EnforcementSource::Override);
         }
         (self.settings.enforce_all, EnforcementSource::Global)
@@ -229,16 +218,9 @@ impl<'a> AccountEnforcement<'a> {
 
     /// The applied value the account set for `def` in the region (an
     /// approved request or the introspection API), if any.
-    fn explicit_value(&mut self, def: &QuotaDef) -> Option<f64> {
-        let data = self.data?;
-        write_applied_key(
-            &mut self.key,
-            self.region,
-            def.global,
-            def.service_code,
-            def.quota_code,
-        );
-        data.applied.get(self.key.as_str()).copied()
+    fn explicit_value(&self, def: &QuotaDef) -> Option<f64> {
+        let key = applied_key(self.region, def.global, def.service_code, def.quota_code);
+        self.data?.applied.get(&key).copied()
     }
 }
 
@@ -342,7 +324,7 @@ mod tests {
             (false, AutoScalingDefault)
         );
 
-        let mut account = AccountEnforcement::new(&settings, Some(&data), "us-east-2");
+        let account = AccountEnforcement::new(&settings, Some(&data), "us-east-2");
         assert_eq!(account.limit(def.service_code, def.quota_code), Some(9.0));
         assert_eq!(
             account.limit(def.service_code, catalog::FIREHOSE_MIB_PER_SECOND),

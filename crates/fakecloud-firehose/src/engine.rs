@@ -234,6 +234,17 @@ impl FirehoseEngine {
         *self.core.quota_provider.write() = Some(provider);
     }
 
+    /// Forget the ingestion usage of streams that no longer exist, so a
+    /// deleted stream's usage goes with it even when nothing is buffered.
+    pub(crate) fn prune_throughput(&self) {
+        let config = self.core.state.read();
+        self.core
+            .registry
+            .lock()
+            .windows
+            .retain(|key, _| current(&config, key).is_some());
+    }
+
     pub fn enqueue(
         &self,
         account: &str,
@@ -328,10 +339,12 @@ impl FirehoseEngine {
         let now = self.core.clock.now();
         let mut accepted = vec![true; records.len()];
         if let Some(limits) = limits {
-            let window = registry
+            // Drop the usage of deleted or reset streams here too: the
+            // scheduler's pass never runs for a stream without S3 delivery.
+            registry
                 .windows
-                .entry(key.clone())
-                .or_insert_with(|| ThroughputWindow::new(now.monotonic));
+                .retain(|key, _| current(&config, key).is_some());
+            let window = registry.windows.entry(key.clone()).or_default();
             if !window.try_request(now.monotonic, limits) {
                 return Err(throughput_error());
             }

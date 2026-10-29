@@ -252,12 +252,10 @@ impl ServiceQuotasProvider {
 
 impl ServiceQuotasProvider {
     /// Apply the organization's template to `account_id` if it is due,
-    /// persisting the change. Whether it changed anything.
-    fn apply_template(&self, account_id: &str) -> bool {
+    /// persisting the change.
+    fn apply_template(&self, account_id: &str) {
         let approval = self.settings.read().request_approval;
-        let applied =
-            apply_template_if_new(&self.state, &self.orgs, approval, account_id, Utc::now());
-        if applied {
+        if apply_template_if_new(&self.state, &self.orgs, approval, account_id, Utc::now()) {
             // The lookup is synchronous; the snapshot write runs on the
             // runtime the enforcing service is called from.
             if let (Some(hook), Ok(rt)) = (
@@ -267,25 +265,6 @@ impl ServiceQuotasProvider {
                 rt.spawn(hook());
             }
         }
-        applied
-    }
-
-    /// The enforced limits of `quota_codes`, from one settings and state
-    /// snapshot.
-    fn snapshot_limits(
-        &self,
-        account_id: &str,
-        region: &str,
-        service_code: &str,
-        quota_codes: &[&str],
-    ) -> Vec<Option<f64>> {
-        let settings = self.settings.read();
-        let guard = self.state.read();
-        let mut account = AccountEnforcement::new(&settings, guard.get(account_id), region);
-        quota_codes
-            .iter()
-            .map(|code| account.limit(service_code, code))
-            .collect()
     }
 }
 
@@ -330,39 +309,23 @@ impl QuotaProvider for ServiceQuotasProvider {
         {
             return vec![None; quota_codes.len()];
         }
-        let limits = self.snapshot_limits(account_id, region, service_code, quota_codes);
-        #[cfg(test)]
-        tests::after_initial_snapshot();
-        if !limits.iter().any(Option::is_some) {
-            // This fast path applies to every enforcing service: an ignored
-            // quota must not trigger the lazy organization-template fallback.
-            // Explicit applied-value lookups still apply a due template.
-            return limits;
-        }
-        // Enforcing something touches the account's quotas, which applies a
-        // due organization template (see `apply_template_if_new`); answer
-        // from the values it left, even if another lookup applied it.
+        // Enforcing touches the account's quotas, which applies a due
+        // organization template (see `apply_template_if_new`) before the
+        // limits are read.
         self.apply_template(account_id);
-        self.snapshot_limits(account_id, region, service_code, quota_codes)
+        let settings = self.settings.read();
+        let guard = self.state.read();
+        let account = AccountEnforcement::new(&settings, guard.get(account_id), region);
+        quota_codes
+            .iter()
+            .map(|code| account.limit(service_code, code))
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    thread_local! {
-        // One-shot scheduling seam, isolated to the lookup's test thread.
-        static AFTER_INITIAL_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    pub(super) fn after_initial_snapshot() {
-        let hook = AFTER_INITIAL_SNAPSHOT.with(|hook| hook.borrow_mut().take());
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
 
     fn provider(settings: crate::settings::QuotaSettings) -> ServiceQuotasProvider {
         use parking_lot::RwLock;
@@ -485,87 +448,6 @@ mod tests {
             ),
             [Some(60.0), Some(5.0)]
         );
-    }
-
-    #[test]
-    fn enforced_limits_resnapshot_when_another_lookup_applies_the_template() {
-        use fakecloud_organizations::{MemberAccount, OrganizationState};
-        use std::sync::mpsc;
-
-        const MGMT: &str = "111111111111";
-        const MEMBER: &str = "222222222222";
-        const REGION: &str = "us-east-1";
-        const CODES: &[&str] = &["L-2AFB9258", "L-0EA8095F", "L-NOPE"];
-        let p = provider(crate::settings::QuotaSettings {
-            enforce_all: true,
-            ..Default::default()
-        });
-        let associated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let mut org = OrganizationState::bootstrap_in(REGION, MGMT);
-        org.accounts.insert(
-            MEMBER.to_string(),
-            MemberAccount {
-                id: MEMBER.to_string(),
-                arn: org.account_arn(MEMBER),
-                email: format!("{MEMBER}@example.com"),
-                name: "member".into(),
-                status: "ACTIVE".into(),
-                joined_method: "CREATED".into(),
-                joined_timestamp: associated_at + chrono::Duration::seconds(1),
-                parent_id: org.root_id.clone(),
-                gov_cloud_mirror: false,
-            },
-        );
-        p.orgs.write().insert(org);
-        {
-            let mut guard = p.state.write();
-            let management = guard.get_or_create(MGMT);
-            management.template_associated_at = Some(associated_at);
-            management.template.insert(
-                crate::state::template_key(catalog::VPC, CODES[0], REGION),
-                TemplateEntry {
-                    service_code: catalog::VPC.into(),
-                    quota_code: CODES[0].into(),
-                    aws_region: REGION.into(),
-                    desired_value: 8.0,
-                },
-            );
-        }
-        assert_eq!(
-            p.snapshot_limits(MEMBER, REGION, catalog::VPC, CODES),
-            [Some(5.0), Some(60.0), None]
-        );
-
-        std::thread::scope(|scope| {
-            let (snapshotted_tx, snapshotted_rx) = mpsc::channel();
-            let (resume_tx, resume_rx) = mpsc::channel();
-            let p = &p;
-            let losing_lookup = scope.spawn(move || {
-                AFTER_INITIAL_SNAPSHOT.with(|hook| {
-                    *hook.borrow_mut() = Some(Box::new(move || {
-                        snapshotted_tx.send(()).unwrap();
-                        resume_rx.recv().unwrap();
-                    }));
-                });
-                p.enforced_limits(MEMBER, REGION, catalog::VPC, CODES)
-            });
-
-            // Both lookups snapshot the defaults before the winner applies
-            // the real template. The paused lookup then sees its marker and
-            // gets false from apply_template, but must still return 8, not 5.
-            snapshotted_rx.recv().unwrap();
-            let winning_limits = p.enforced_limits(MEMBER, REGION, catalog::VPC, CODES);
-            resume_tx.send(()).unwrap();
-            let losing_limits = losing_lookup.join().unwrap();
-            assert_eq!(winning_limits, [Some(8.0), Some(60.0), None]);
-            assert_eq!(losing_limits, [Some(8.0), Some(60.0), None]);
-        });
-        assert!(!p.apply_template(MEMBER));
-        let guard = p.state.read();
-        let member = guard.get(MEMBER).unwrap();
-        assert!(member.template_checked.is_some());
-        assert_eq!(member.requests.len(), 1, "template applied more than once");
-        assert_eq!(member.requests.values().next().unwrap().status, "APPROVED");
     }
 
     /// With enforcement off, an enforcing service's limit lookup on its

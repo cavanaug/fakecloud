@@ -660,3 +660,47 @@ async fn successful_delivery_and_destination_updates_do_not_reset_budget() {
     assert_eq!(batches[1].records, vec![record(b'b', 1)]);
     assert!(batches[1].object_key.starts_with("updated/"));
 }
+
+/// Without S3 delivery the scheduler never runs for a stream, so its usage
+/// must go when the stream is deleted (or reset away) on its own.
+#[tokio::test]
+async fn deleted_streams_without_s3_delivery_drop_their_usage_without_a_scan() {
+    use fakecloud_core::service::AwsService;
+    let windows = |f: &Fixture| f.engine.core.registry.lock().windows.len();
+
+    // DeleteDeliveryStream prunes immediately.
+    let f = Fixture::new(60);
+    f.update(NAME, |s| s.destination = None);
+    enforce(&f, Some(10.0), None, None);
+    let svc = crate::FirehoseService::default().with_engine(f.engine.clone());
+    put(&f, vec![record(b'a', 1)]).unwrap();
+    assert_eq!(windows(&f), 1);
+    svc.handle(request(
+        "DeleteDeliveryStream",
+        json!({"DeliveryStreamName": NAME}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(windows(&f), 0);
+
+    // A reset only touches configuration; the next metered call prunes it.
+    let f = Fixture::new(60);
+    f.update(NAME, |s| s.destination = None);
+    enforce(&f, Some(10.0), None, None);
+    put(&f, vec![record(b'a', 1)]).unwrap();
+    f.engine.core.state.write().accounts.clear();
+    f.add_stream(ACCOUNT, REGION, "other", 60);
+    f.update("other", |s| s.destination = None);
+    f.engine
+        .enqueue_put(ACCOUNT, REGION, "other", vec![record(b'b', 1)])
+        .unwrap();
+    let registry = f.engine.core.registry.lock();
+    assert_eq!(
+        registry
+            .windows
+            .keys()
+            .map(|key| key.name.as_str())
+            .collect::<Vec<_>>(),
+        ["other"]
+    );
+}

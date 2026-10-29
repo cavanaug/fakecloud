@@ -846,6 +846,8 @@ impl FirehoseService {
         if state.streams_mut(&req.region).remove(name).is_none() {
             return Err(not_found(name));
         }
+        drop(accounts);
+        self.engine.prune_throughput();
         Ok(AwsResponse::ok_json(json!({})))
     }
 

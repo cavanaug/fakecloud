@@ -1293,10 +1293,11 @@ fn firehose_introspection_reports_auto_scaling_defaults_as_unenforced() {
     assert_eq!(state(&deleted), off("auto_scaling_default"));
 }
 
-/// Another service's limit lookup applies a due Organizations template only
-/// when it enforces something; an unenforced lookup leaves the account alone.
+/// Another service's limit lookup of an enforceable quota applies a due
+/// Organizations template, whether or not it enforces anything, and applies
+/// it once.
 #[test]
-fn enforced_limit_applies_the_template_only_once_enforced() {
+fn enforced_limit_applies_a_due_template_even_when_unenforced() {
     use fakecloud_core::quota::QuotaProvider;
     let o = org_with_member(3600);
     let s = svc_with(o);
@@ -1313,7 +1314,26 @@ fn enforced_limit_applies_the_template_only_once_enforced() {
         p.enforced_limit(MEMBER, "us-east-1", "vpc", "L-2AFB9258"),
         None
     );
-    assert!(s.state.read().get(MEMBER).is_none(), "template applied");
+    assert_eq!(
+        s.state.read().get(MEMBER).unwrap().requests.len(),
+        1,
+        "template not applied"
+    );
+    // A quota no service checks never touches the account's quotas.
+    let s2 = svc_with(org_with_member(3600));
+    run(
+        &s2,
+        MGMT,
+        "PutServiceQuotaIncreaseRequestIntoTemplate",
+        json!({ "ServiceCode": "vpc", "QuotaCode": "L-2AFB9258", "AwsRegion": "us-east-1", "DesiredValue": 8.0 }),
+    )
+    .unwrap();
+    run(&s2, MGMT, "AssociateServiceQuotaTemplate", json!({})).unwrap();
+    assert_eq!(
+        provider(&s2).enforced_limit(MEMBER, "us-east-1", "lambda", "L-B99A9384"),
+        None
+    );
+    assert!(s2.state.read().get(MEMBER).is_none(), "template applied");
 
     enforce_all(&s, true);
     assert_eq!(
